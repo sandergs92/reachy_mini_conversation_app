@@ -47,7 +47,8 @@ MAX_SPEECH_DURATION_S = 60.0
 SMART_TURN_THRESHOLD = 0.5
 
 _STOP_CHUNKS = math.ceil(STOP_MS / _CHUNK_MS)
-_MAX_SPEECH_CHUNKS = math.ceil(MAX_SPEECH_DURATION_S / (_SILERO_CHUNK / _SMART_TURN_SR))
+_MAX_SPEECH_CHUNKS = math.ceil(
+    MAX_SPEECH_DURATION_S / (_SILERO_CHUNK / _SMART_TURN_SR))
 _PRE_CHUNKS_COUNT = math.ceil(PRE_SPEECH_MS / _CHUNK_MS)
 
 # Cost tracking from usage data (pricing as of Feb 2026 https://openai.com/api/pricing/)
@@ -64,12 +65,17 @@ def _compute_response_cost(usage: Any) -> float:
     out = getattr(usage, "output_token_details", None)
     cost = 0.0
     if inp:
-        cost += (getattr(inp, "audio_tokens", 0) or 0) * AUDIO_INPUT_COST_PER_1M / 1e6
-        cost += (getattr(inp, "text_tokens", 0) or 0) * TEXT_INPUT_COST_PER_1M / 1e6
-        cost += (getattr(inp, "image_tokens", 0) or 0) * IMAGE_INPUT_COST_PER_1M / 1e6
+        cost += (getattr(inp, "audio_tokens", 0) or 0) * \
+            AUDIO_INPUT_COST_PER_1M / 1e6
+        cost += (getattr(inp, "text_tokens", 0) or 0) * \
+            TEXT_INPUT_COST_PER_1M / 1e6
+        cost += (getattr(inp, "image_tokens", 0) or 0) * \
+            IMAGE_INPUT_COST_PER_1M / 1e6
     if out:
-        cost += (getattr(out, "audio_tokens", 0) or 0) * AUDIO_OUTPUT_COST_PER_1M / 1e6
-        cost += (getattr(out, "text_tokens", 0) or 0) * TEXT_OUTPUT_COST_PER_1M / 1e6
+        cost += (getattr(out, "audio_tokens", 0) or 0) * \
+            AUDIO_OUTPUT_COST_PER_1M / 1e6
+        cost += (getattr(out, "text_tokens", 0) or 0) * \
+            TEXT_OUTPUT_COST_PER_1M / 1e6
     return cost
 
 
@@ -95,7 +101,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self.input_sample_rate = OPEN_AI_INPUT_SAMPLE_RATE
 
         self.connection: Any = None
-        self.output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]" = asyncio.Queue()
+        self.output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]" = asyncio.Queue(
+        )
 
         self.last_activity_time = asyncio.get_event_loop().time()
         self.start_time = asyncio.get_event_loop().time()
@@ -138,12 +145,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._trailing_silence_chunks: int = 0
         self._since_trigger_chunks: int = 0
         self._segment_chunks: list[np.ndarray] = []
-        self._pre_buffer: collections.deque[np.ndarray] = collections.deque(maxlen=_PRE_CHUNKS_COUNT)
+        self._pre_buffer: collections.deque[np.ndarray] = collections.deque(
+            maxlen=_PRE_CHUNKS_COUNT)
         # Tracks whether a response is currently being streamed (so we can interrupt it)
         self._response_active: bool = False
-        # True from the moment speech is detected until SmartTurn commits the turn.
-        # Wider than _is_speaking: stays True during trailing-silence evaluation too.
-        self._user_turn_active: bool = False
 
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
@@ -165,7 +170,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
             set_custom_profile(profile)
             logger.info(
-                "Set custom profile to %r (config=%r)", profile, getattr(_config, "REACHY_MINI_CUSTOM_PROFILE", None)
+                "Set custom profile to %r (config=%r)", profile, getattr(
+                    _config, "REACHY_MINI_CUSTOM_PROFILE", None)
             )
 
             try:
@@ -185,16 +191,19 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             "output_modalities": ["text"],
                         },
                     )
-                    logger.info("Applied personality via live update: %s", profile or "built-in default")
+                    logger.info("Applied personality via live update: %s",
+                                profile or "built-in default")
                 except Exception as e:
-                    logger.warning("Live update failed; will restart session: %s", e)
+                    logger.warning(
+                        "Live update failed; will restart session: %s", e)
 
                 # Force a real restart to guarantee the new instructions/voice
                 try:
                     await self._restart_session()
                     return "Applied personality and restarted realtime session."
                 except Exception as e:
-                    logger.warning("Failed to restart session after apply: %s", e)
+                    logger.warning(
+                        "Failed to restart session after apply: %s", e)
                     return "Applied personality. Will take effect on next connection."
             else:
                 logger.info(
@@ -237,7 +246,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 # In headless console mode, LocalStream now blocks startup until the key is provided.
                 # However, unit tests may invoke this handler directly with a stubbed client.
                 # To keep tests hermetic without requiring a real key, fall back to a placeholder.
-                logger.warning("OPENAI_API_KEY missing. Proceeding with a placeholder (tests/offline).")
+                logger.warning(
+                    "OPENAI_API_KEY missing. Proceeding with a placeholder (tests/offline).")
                 openai_api_key = "DUMMY"
 
         self.client = AsyncOpenAI(api_key=openai_api_key)
@@ -252,7 +262,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 return
             except ConnectionClosedError as e:
                 # Abrupt close (e.g., "no close frame received or sent") → retry
-                logger.warning("Realtime websocket closed unexpectedly (attempt %d/%d): %s", attempt, max_attempts, e)
+                logger.warning(
+                    "Realtime websocket closed unexpectedly (attempt %d/%d): %s", attempt, max_attempts, e)
                 if attempt < max_attempts:
                     # exponential backoff with jitter
                     base_delay = 2 ** (attempt - 1)  # 1s, 2s, 4s, 8s, etc.
@@ -286,7 +297,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
             # Ensure we have a client (start_up must have run once)
             if getattr(self, "client", None) is None:
-                logger.warning("Cannot restart: OpenAI client not initialized yet.")
+                logger.warning(
+                    "Cannot restart: OpenAI client not initialized yet.")
                 return
 
             # Fire-and-forget new session and wait briefly for connection
@@ -294,12 +306,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 self._connected_event.clear()
             except Exception:
                 pass
-            asyncio.create_task(self._run_realtime_session(), name="openai-realtime-restart")
+            asyncio.create_task(self._run_realtime_session(),
+                                name="openai-realtime-restart")
             try:
                 await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
                 logger.info("Realtime session restarted and connected.")
             except asyncio.TimeoutError:
-                logger.warning("Realtime session restart timed out; continuing in background.")
+                logger.warning(
+                    "Realtime session restart timed out; continuing in background.")
         except Exception as e:
             logger.warning("_restart_session failed: %s", e)
 
@@ -319,13 +333,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                     "rate": self.input_sample_rate,
                                 },
                                 "transcription": {"model": "gpt-4o-transcribe", "language": "en"},
-                                # Use server_vad for speech events and auto-commit, but disable
-                                # auto-responses entirely — SmartTurn decides when to respond.
-                                "turn_detection": {
-                                    "type": "server_vad",
-                                    "create_response": False,
-                                    "interrupt_response": False,
-                                },
+                                # No turn_detection key — SmartTurn handles this client-side.
                             },
                         },
                         # type: ignore[typeddict-item]
@@ -342,7 +350,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 # Persist the key to a newly created .env (copied from .env.example) if needed.
                 self._persist_api_key_if_needed()
             except Exception:
-                logger.exception("Realtime session.update failed; aborting startup")
+                logger.exception(
+                    "Realtime session.update failed; aborting startup")
                 return
 
             logger.info("Realtime session updated successfully")
@@ -360,30 +369,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 pass
             async for event in self.connection:
                 logger.debug(f"OpenAI event: {event.type}")
-
-                if event.type == "input_audio_buffer.speech_started":
-                    # Interrupt any active response when user starts speaking
-                    if self._response_active:
-                        try:
-                            await self.connection.response.cancel()
-                        except Exception as e:
-                            logger.debug("Could not cancel response on speech_started: %s", e)
-                        if hasattr(self, "_clear_queue") and callable(self._clear_queue):
-                            self._clear_queue()
-                        self._text_response_buffer = ""
-                        self._vad_residual = np.empty(0, dtype=np.float32)
-                    if self.deps.head_wobbler is not None:
-                        self.deps.head_wobbler.reset()
-                    self.deps.movement_manager.set_listening(True)
-                    logger.debug("SmartTurn: server VAD speech_started")
-
-                if event.type == "input_audio_buffer.speech_stopped":
-                    # Server VAD detected end-of-speech and auto-committed the buffer.
-                    # Now run SmartTurn inference to decide whether to actually respond.
-                    logger.debug("SmartTurn: server VAD speech_stopped — scheduling inference")
-                    asyncio.create_task(self._evaluate_turn_endpoint(), name="smart-turn-eval")
-
-
                 if event.type in (
                     "response.audio.done",  # GA
                     "response.output_audio.done",  # GA alias
@@ -403,17 +388,21 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     self._response_active = False
 
                     response = getattr(event, "response", None)
-                    usage = getattr(response, "usage", None) if response else None
+                    usage = getattr(response, "usage",
+                                    None) if response else None
                     if usage:
                         cost = _compute_response_cost(usage)
                         self.cumulative_cost += cost
-                        logger.debug("Cost: $%.4f | Cumulative: $%.4f", cost, self.cumulative_cost)
+                        logger.debug("Cost: $%.4f | Cumulative: $%.4f",
+                                     cost, self.cumulative_cost)
                     else:
-                        logger.warning("No usage data available for cost tracking")
+                        logger.warning(
+                            "No usage data available for cost tracking")
 
                 # Handle partial transcription (user speaking in real-time)
                 if event.type == "conversation.item.input_audio_transcription.partial":
-                    logger.debug(f"User partial transcript: {event.transcript}")
+                    logger.debug(f"User partial transcript: {
+                                 event.transcript}")
 
                     # Increment sequence
                     self.partial_transcript_sequence += 1
@@ -429,7 +418,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
                     # Start new debounce timer with sequence number
                     self.partial_transcript_task = asyncio.create_task(
-                        self._emit_debounced_partial(event.transcript, current_sequence)
+                        self._emit_debounced_partial(
+                            event.transcript, current_sequence)
                     )
 
                 # Handle completed transcription (user finished speaking)
@@ -455,19 +445,22 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 if event.type in ("response.text.delta", "response.output_text.delta"):
                     self._text_response_buffer += event.delta
                     self.last_activity_time = asyncio.get_event_loop().time()
-                    logger.debug("Text delta received, buffer length: %d", len(self._text_response_buffer))
+                    logger.debug("Text delta received, buffer length: %d", len(
+                        self._text_response_buffer))
 
                 # Handle text completion – flush accumulated text to TTS worker
                 if event.type in ("response.text.done", "response.output_text.done"):
                     full_text = self._text_response_buffer.strip()
                     self._text_response_buffer = ""
                     if full_text:
-                        logger.info("Sending to TTS worker: %s", full_text[:80])
+                        logger.info("Sending to TTS worker: %s",
+                                    full_text[:80])
                         await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": full_text}))
                         if self._tts_worker is not None:
                             self._tts_worker.say(full_text)
                         self.last_activity_time = asyncio.get_event_loop().time()
-                        logger.debug("last activity time updated to %s", self.last_activity_time)
+                        logger.debug(
+                            "last activity time updated to %s", self.last_activity_time)
 
                 # ---- tool-calling plumbing ----
                 if event.type == "response.function_call_arguments.done":
@@ -476,12 +469,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     call_id = getattr(event, "call_id", None)
 
                     if not isinstance(tool_name, str) or not isinstance(args_json_str, str):
-                        logger.error("Invalid tool call: tool_name=%s, args=%s", tool_name, args_json_str)
+                        logger.error(
+                            "Invalid tool call: tool_name=%s, args=%s", tool_name, args_json_str)
                         continue
 
                     try:
                         tool_result = await dispatch_tool_call(tool_name, args_json_str, self.deps)
-                        logger.debug("Tool '%s' executed successfully", tool_name)
+                        logger.debug(
+                            "Tool '%s' executed successfully", tool_name)
                         logger.debug("Tool result: %s", tool_result)
                     except Exception as e:
                         logger.error("Tool '%s' failed", tool_name)
@@ -511,7 +506,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         # use raw base64, don't json.dumps (which adds quotes)
                         b64_im = tool_result["b64_im"]
                         if not isinstance(b64_im, str):
-                            logger.warning("Unexpected type for b64_im: %s", type(b64_im))
+                            logger.warning(
+                                "Unexpected type for b64_im: %s", type(b64_im))
                             b64_im = str(b64_im)
                         await self.connection.conversation.item.create(
                             item={
@@ -531,7 +527,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             np_img = self.deps.camera_worker.get_latest_frame()
                             if np_img is not None:
                                 # Camera frames are BGR from OpenCV; convert so Gradio displays correct colors.
-                                rgb_frame = cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB)
+                                rgb_frame = cv2.cvtColor(
+                                    np_img, cv2.COLOR_BGR2RGB)
                             else:
                                 rgb_frame = None
                             img = gr.Image(value=rgb_frame)
@@ -546,12 +543,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             )
 
                     # if this tool call was triggered by an idle signal, don't make the robot speak
-                    # for other tool calls, let the robot reply out loud — but only if the user
-                    # isn't currently speaking (SmartTurn may be mid-evaluation)
+                    # for other tool calls, let the robot reply out loud
                     if self.is_idle_tool_call:
                         self.is_idle_tool_call = False
-                    elif self._user_turn_active:
-                        logger.debug("SmartTurn: skipping post-tool response.create() — user turn in progress")
                     else:
                         await self.connection.response.create(
                             response={
@@ -566,15 +560,18 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 # server error
                 if event.type == "error":
                     err = getattr(event, "error", None)
-                    msg = getattr(err, "message", str(err) if err else "unknown error")
+                    msg = getattr(err, "message", str(
+                        err) if err else "unknown error")
                     code = getattr(err, "code", "")
 
-                    logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
+                    logger.error(
+                        "Realtime error [%s]: %s (raw=%s)", code, msg, err)
 
                     # Only show user-facing errors, not internal state errors
                     if code not in ("input_audio_buffer_commit_empty", "conversation_already_has_active_response"):
                         await self.output_queue.put(
-                            AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
+                            AdditionalOutputs(
+                                {"role": "assistant", "content": f"[error] {msg}"})
                         )
 
     # Microphone receive
@@ -602,14 +599,16 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         # Resample to OpenAI rate if needed
         if self.input_sample_rate != input_sample_rate:
-            audio_frame = resample(audio_frame, int(len(audio_frame) * self.input_sample_rate / input_sample_rate))
+            audio_frame = resample(audio_frame, int(
+                len(audio_frame) * self.input_sample_rate / input_sample_rate))
 
         # Cast if needed
         audio_frame = audio_to_int16(audio_frame)
 
         # Send to OpenAI (guard against races during reconnect)
         try:
-            audio_message = base64.b64encode(audio_frame.tobytes()).decode("utf-8")
+            audio_message = base64.b64encode(
+                audio_frame.tobytes()).decode("utf-8")
             await self.connection.input_audio_buffer.append(audio=audio_message)
         except Exception as e:
             logger.debug("Dropping audio frame: connection not ready (%s)", e)
@@ -631,7 +630,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
                 if is_speech:
                     self._is_speaking = True
-                    self._user_turn_active = True
                     self._trailing_silence_chunks = 0
                     self._since_trigger_chunks = 1
                     self._segment_chunks = list(self._pre_buffer)
@@ -650,7 +648,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     if self.deps.head_wobbler is not None:
                         self.deps.head_wobbler.reset()
                     self.deps.movement_manager.set_listening(True)
-                    logger.info("SmartTurn: speech detected, accumulating segment")
+                    logger.debug("SmartTurn: speech started")
 
             else:
                 self._segment_chunks.append(vad_chunk)
@@ -660,8 +658,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     self._trailing_silence_chunks = 0
                 else:
                     self._trailing_silence_chunks += 1
-                # Note: _evaluate_turn_endpoint() is triggered by the server's
-                # speech_stopped event, not by the silence counter here.
+
+                if self._trailing_silence_chunks >= _STOP_CHUNKS or self._since_trigger_chunks >= _MAX_SPEECH_CHUNKS:
+                    await self._evaluate_turn_endpoint()
 
     async def _evaluate_turn_endpoint(self) -> None:
         """Run SmartTurn inference on the accumulated segment and commit the turn
@@ -678,7 +677,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # OpenAI requires at least 100ms of audio in the buffer — skip inference and bail
         # early if the segment is too short (likely a noise blip, not real speech)
         if seg_dur < 0.1:
-            logger.debug("SmartTurn: segment too short (%.0fms), ignoring", seg_dur * 1000)
+            logger.debug(
+                "SmartTurn: segment too short (%.0fms), ignoring", seg_dur * 1000)
             self._reset_vad_state()
             return
 
@@ -686,26 +686,35 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(None, predict_endpoint, segment_audio)
         except Exception as e:
-            logger.warning("SmartTurn inference failed: %s – committing turn anyway", e)
+            logger.warning(
+                "SmartTurn inference failed: %s – committing turn anyway", e)
             result = {"prediction": 1, "probability": float("nan")}
 
         pred = result.get("prediction", 0)
         prob = result.get("probability", float("nan"))
-        label = "COMPLETE  ✓" if pred == 1 else "incomplete ↩"
-        logger.info("SmartTurn: %s (p=%.3f, dur=%.2fs)", label, prob, seg_dur)
+        label = "Complete" if pred == 1 else "Incomplete"
+        logger.debug("SmartTurn: %s (p=%.3f, %.2fs)", label, prob, seg_dur)
 
         if pred == 1:
-            # Turn is complete — the server already committed the buffer on speech_stopped,
-            # so just request a response.
+            # Turn is complete — commit the audio buffer and ask OpenAI to respond
             self.deps.movement_manager.set_listening(False)
-            logger.info("SmartTurn: committing buffer and requesting response")
+            logger.debug(
+                "SmartTurn: turn endpoint detected, committing buffer")
 
             # Reset VAD state first so new speech can be detected immediately
             self._reset_vad_state()
 
+            # Commit may fail if buffer is too small (e.g. very short utterance) — bail out
+            try:
+                await self.connection.input_audio_buffer.commit()
+            except Exception as e:
+                logger.debug("SmartTurn: buffer commit skipped: %s", e)
+                return
+
             # Only create a response if one isn't already running
             if self._response_active:
-                logger.debug("SmartTurn: response already active, skipping response.create()")
+                logger.debug(
+                    "SmartTurn: response already active, skipping response.create()")
                 return
             try:
                 await self.connection.response.create()
@@ -713,13 +722,13 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 logger.warning("SmartTurn: failed to create response: %s", e)
         else:
             # Incomplete utterance — keep listening, reset trailing silence counter
-            logger.info("SmartTurn: utterance incomplete, waiting for more speech (p=%.3f, dur=%.2fs so far)", prob, seg_dur)
+            logger.debug(
+                "SmartTurn: utterance incomplete, waiting for more speech")
             self._trailing_silence_chunks = 0
 
     def _reset_vad_state(self) -> None:
         """Reset all SmartTurn / VAD state for the next utterance."""
         self._is_speaking = False
-        self._user_turn_active = False
         self._trailing_silence_chunks = 0
         self._since_trigger_chunks = 0
         self._segment_chunks.clear()
@@ -747,7 +756,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             try:
                 await self.send_idle_signal(idle_duration)
             except Exception as e:
-                logger.warning("Idle signal skipped (connection closed?): %s", e)
+                logger.warning(
+                    "Idle signal skipped (connection closed?): %s", e)
                 return None
 
             self.last_activity_time = asyncio.get_event_loop().time()  # avoid repeated resets
@@ -892,19 +902,23 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         """
         try:
             if not self.gradio_mode:
-                logger.warning("Not in Gradio mode; skipping API key persistence.")
+                logger.warning(
+                    "Not in Gradio mode; skipping API key persistence.")
                 return
 
             if self._key_source != "textbox":
-                logger.info("API key not provided via textbox; skipping persistence.")
+                logger.info(
+                    "API key not provided via textbox; skipping persistence.")
                 return
 
             key = (self._provided_api_key or "").strip()
             if not key:
-                logger.warning("No API key provided via textbox; skipping persistence.")
+                logger.warning(
+                    "No API key provided via textbox; skipping persistence.")
                 return
             if self.instance_path is None:
-                logger.warning("Instance path is None; cannot persist API key.")
+                logger.warning(
+                    "Instance path is None; cannot persist API key.")
                 return
 
             # Update the current process environment for downstream consumers
@@ -919,7 +933,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             env_path = target_dir / ".env"
             if env_path.exists():
                 # Respect existing user configuration
-                logger.info(".env already exists at %s; not overwriting.", env_path)
+                logger.info(
+                    ".env already exists at %s; not overwriting.", env_path)
                 return
 
             example_path = target_dir / ".env.example"
@@ -929,7 +944,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     content = example_path.read_text(encoding="utf-8")
                     content_lines = content.splitlines()
                 except Exception as e:
-                    logger.warning("Failed to read .env.example at %s: %s", example_path, e)
+                    logger.warning(
+                        "Failed to read .env.example at %s: %s", example_path, e)
 
             # Replace or append the OPENAI_API_KEY line
             replaced = False
@@ -944,7 +960,56 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             # Ensure file ends with newline
             final_text = "\n".join(content_lines) + "\n"
             env_path.write_text(final_text, encoding="utf-8")
-            logger.info("Created %s and stored OPENAI_API_KEY for future runs.", env_path)
+            logger.info(
+                "Created %s and stored OPENAI_API_KEY for future runs.", env_path)
+        except Exception as e:
+            # Never crash the app for QoL persistence; just log.
+            logger.warning("Could not persist OPENAI_API_KEY to .env: %s", e)
+                logger.warning(
+                    "Instance path is None; cannot persist API key.")
+                return
+
+            # Update the current process environment for downstream consumers
+            try:
+                import os
+
+                os.environ["OPENAI_API_KEY"] = key
+            except Exception:  # best-effort
+                pass
+
+            target_dir = Path(self.instance_path)
+            env_path = target_dir / ".env"
+            if env_path.exists():
+                # Respect existing user configuration
+                logger.info(
+                    ".env already exists at %s; not overwriting.", env_path)
+                return
+
+            example_path = target_dir / ".env.example"
+            content_lines: list[str] = []
+            if example_path.exists():
+                try:
+                    content = example_path.read_text(encoding="utf-8")
+                    content_lines = content.splitlines()
+                except Exception as e:
+                    logger.warning(
+                        "Failed to read .env.example at %s: %s", example_path, e)
+
+            # Replace or append the OPENAI_API_KEY line
+            replaced = False
+            for i, line in enumerate(content_lines):
+                if line.strip().startswith("OPENAI_API_KEY="):
+                    content_lines[i] = f"OPENAI_API_KEY={key}"
+                    replaced = True
+                    break
+            if not replaced:
+                content_lines.append(f"OPENAI_API_KEY={key}")
+
+            # Ensure file ends with newline
+            final_text = "\n".join(content_lines) + "\n"
+            env_path.write_text(final_text, encoding="utf-8")
+            logger.info(
+                "Created %s and stored OPENAI_API_KEY for future runs.", env_path)
         except Exception as e:
             # Never crash the app for QoL persistence; just log.
             logger.warning("Could not persist OPENAI_API_KEY to .env: %s", e)
