@@ -18,6 +18,7 @@ from websockets.exceptions import ConnectionClosedError
 
 from reachy_mini_conversation_app.config import config
 from reachy_mini_conversation_app.prompts import get_session_voice, get_session_instructions
+from reachy_mini_conversation_app.tts.worker import TTSWorker
 from reachy_mini_conversation_app.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
@@ -86,9 +87,22 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._key_source: Literal["env", "textbox"] = "env"
         self._provided_api_key: str | None = None
 
+        # TTS worker for text-to-speech via Piper + Claptrap FX
+        media = self.deps.reachy_mini.media
+        output_sr = media.get_output_audio_samplerate()
+        self._tts_worker = TTSWorker(
+            media,
+            output_sr,
+            head_wobbler=self.deps.head_wobbler,
+        )
+
+        # Buffer for accumulating text deltas from the realtime API
+        self._text_response_buffer: str = ""
+
         # Debouncing for partial transcripts
         self.partial_transcript_task: asyncio.Task[None] | None = None
-        self.partial_transcript_sequence: int = 0  # sequence counter to prevent stale emissions
+        # sequence counter to prevent stale emissions
+        self.partial_transcript_sequence: int = 0
         self.partial_debounce_delay = 0.5  # seconds
 
         # Internal lifecycle flags
@@ -135,7 +149,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         session={
                             "type": "realtime",
                             "instructions": instructions,
-                            "audio": {"output": {"voice": voice}},
+                            "output_modalities": ["text"],
                         },
                     )
                     logger.info("Applied personality via live update: %s", profile or "built-in default")
@@ -194,6 +208,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 openai_api_key = "DUMMY"
 
         self.client = AsyncOpenAI(api_key=openai_api_key)
+
+        self._tts_worker.start()
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -262,6 +278,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     session={
                         "type": "realtime",
                         "instructions": get_session_instructions(),
+                        "output_modalities": ["text"],
                         "audio": {
                             "input": {
                                 "format": {
@@ -274,15 +291,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                     "interrupt_response": True,
                                 },
                             },
-                            "output": {
-                                "format": {
-                                    "type": "audio/pcm",
-                                    "rate": self.output_sample_rate,
-                                },
-                                "voice": get_session_voice(),
-                            },
                         },
-                        "tools": get_tool_specs(),  # type: ignore[typeddict-item]
+                        # type: ignore[typeddict-item]
+                        "tools": get_tool_specs(),
                         "tool_choice": "auto",
                     },
                 )
@@ -313,6 +324,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         self._clear_queue()
                     if self.deps.head_wobbler is not None:
                         self.deps.head_wobbler.reset()
+                    # Discard any partially accumulated text response on interruption
+                    self._text_response_buffer = ""
                     self.deps.movement_manager.set_listening(True)
                     logger.debug("User speech started")
 
@@ -334,8 +347,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 if event.type == "response.done":
                     # Doesn't mean the audio is done playing
                     logger.debug("Response done")
-
-
 
                     response = getattr(event, "response", None)
                     usage = getattr(response, "usage", None) if response else None
@@ -386,18 +397,23 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     logger.debug(f"Assistant transcript: {event.transcript}")
                     await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": event.transcript}))
 
-                # Handle audio delta
-                if event.type in ("response.audio.delta", "response.output_audio.delta"):
-                    if self.deps.head_wobbler is not None:
-                        self.deps.head_wobbler.feed(event.delta)
+                # Handle text delta – accumulate tokens into a buffer
+                if event.type in ("response.text.delta", "response.output_text.delta"):
+                    self._text_response_buffer += event.delta
                     self.last_activity_time = asyncio.get_event_loop().time()
-                    logger.debug("last activity time updated to %s", self.last_activity_time)
-                    await self.output_queue.put(
-                        (
-                            self.output_sample_rate,
-                            np.frombuffer(base64.b64decode(event.delta), dtype=np.int16).reshape(1, -1),
-                        ),
-                    )
+                    logger.debug("Text delta received, buffer length: %d", len(self._text_response_buffer))
+
+                # Handle text completion – flush accumulated text to TTS worker
+                if event.type in ("response.text.done", "response.output_text.done"):
+                    full_text = self._text_response_buffer.strip()
+                    self._text_response_buffer = ""
+                    if full_text:
+                        logger.info("Sending to TTS worker: %s", full_text[:80])
+                        await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": full_text}))
+                        if self._tts_worker is not None:
+                            self._tts_worker.say(full_text)
+                        self.last_activity_time = asyncio.get_event_loop().time()
+                        logger.debug("last activity time updated to %s", self.last_activity_time)
 
                 # ---- tool-calling plumbing ----
                 if event.type == "response.function_call_arguments.done":
@@ -482,7 +498,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     else:
                         await self.connection.response.create(
                             response={
-                                "instructions": "Use the tool result just returned and answer concisely in speech.",
+                                "instructions": "Use the tool result just returned and answer concisely.",
                             },
                         )
 
@@ -561,7 +577,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
             self.last_activity_time = asyncio.get_event_loop().time()  # avoid repeated resets
 
-        return await wait_for_item(self.output_queue)  # type: ignore[no-any-return]
+        # type: ignore[no-any-return]
+        return await wait_for_item(self.output_queue)
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
@@ -590,6 +607,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 self.output_queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
+
+        self._tts_worker.stop()
 
     def format_timestamp(self) -> str:
         """Format current timestamp with date, time, and elapsed seconds."""
@@ -669,7 +688,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         """Send an idle signal to the openai server."""
         logger.debug("Sending idle signal")
         self.is_idle_tool_call = True
-        timestamp_msg = f"[Idle time update: {self.format_timestamp()} - No activity for {idle_duration:.1f}s] You've been idle for a while. Feel free to get creative - dance, show an emotion, look around, do nothing, or just be yourself!"
+        timestamp_msg = f"[Idle time update: {self.format_timestamp()} - No activity for {
+            idle_duration:.1f}s] You've been idle for a while. Feel free to get creative - dance, show an emotion, look around, do nothing, or just be yourself!"
         if not self.connection:
             logger.debug("No connection, cannot send idle signal")
             return
