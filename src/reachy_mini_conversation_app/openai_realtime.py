@@ -1,6 +1,6 @@
 import json
 import math
-import base64
+import time
 import random
 import asyncio
 import logging
@@ -27,10 +27,26 @@ from reachy_mini_conversation_app.tools.core_tools import (
     get_tool_specs,
     dispatch_tool_call,
 )
+
+# ── Local diar+ASR pipeline imports ───────────────────────────────────────
+from reachy_mini_conversation_app.pipeline.pipeline import (
+    DiarAsrPipeline,
+    StreamingDiarAsrStreamer,
+    build_diar_asr_pipeline,
+)
 from reachy_mini_conversation_app.smart_turn.inference import predict_endpoint
 
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)
+
+# Dedicated logger for SmartTurn + pipeline ASR/diarization output.
+# Always visible by default; set to WARNING to suppress.
+pipeline_logger = logging.getLogger(f"{__name__}.pipeline")
+pipeline_logger.setLevel(logging.INFO)
+
+# Suppress verbose per-chunk logs from faster-whisper internals
+logging.getLogger("faster_whisper").setLevel(logging.WARNING)
 
 OPEN_AI_INPUT_SAMPLE_RATE: Final[Literal[24000]] = 24000
 OPEN_AI_OUTPUT_SAMPLE_RATE: Final[Literal[24000]] = 24000
@@ -47,8 +63,24 @@ MAX_SPEECH_DURATION_S = 60.0
 SMART_TURN_THRESHOLD = 0.5
 
 _STOP_CHUNKS = math.ceil(STOP_MS / _CHUNK_MS)
-_MAX_SPEECH_CHUNKS = math.ceil(MAX_SPEECH_DURATION_S / (_SILERO_CHUNK / _SMART_TURN_SR))
+_MAX_SPEECH_CHUNKS = math.ceil(
+    MAX_SPEECH_DURATION_S / (_SILERO_CHUNK / _SMART_TURN_SR))
 _PRE_CHUNKS_COUNT = math.ceil(PRE_SPEECH_MS / _CHUNK_MS)
+
+# ── Local pipeline configuration ─────────────────────────────────────────
+_PIPELINE_SR = 16_000  # pipeline expects 16 kHz mono
+_PIPELINE_CHUNK_DURATION_S = 0.32  # push interval
+_PIPELINE_CHUNK_SAMPLES = int(
+    _PIPELINE_SR * _PIPELINE_CHUNK_DURATION_S)  # 5120
+_DIAR_CHUNK_SAMPLES = 3 * 8 * 160  # diarization sub-chunk (from NeMo config)
+_PIPELINE_MAX_SECONDS = 10.0  # max buffered seconds in streamer
+_PREROLL_S = 0.24  # seconds of audio to prepend before speech onset
+_PREROLL_SAMPLES = int(_PIPELINE_SR * _PREROLL_S)
+_PIPELINE_LANGUAGE = "nl"
+_PIPELINE_NUM_SPK = 4
+
+# ── Event poller configuration ────────────────────────────────────────────
+_EVENT_POLL_INTERVAL_S = 0.02  # 50 Hz, matches demo EventConsumer
 
 # Cost tracking from usage data (pricing as of Feb 2026 https://openai.com/api/pricing/)
 AUDIO_INPUT_COST_PER_1M = 32.0
@@ -64,17 +96,27 @@ def _compute_response_cost(usage: Any) -> float:
     out = getattr(usage, "output_token_details", None)
     cost = 0.0
     if inp:
-        cost += (getattr(inp, "audio_tokens", 0) or 0) * AUDIO_INPUT_COST_PER_1M / 1e6
-        cost += (getattr(inp, "text_tokens", 0) or 0) * TEXT_INPUT_COST_PER_1M / 1e6
-        cost += (getattr(inp, "image_tokens", 0) or 0) * IMAGE_INPUT_COST_PER_1M / 1e6
+        cost += (getattr(inp, "audio_tokens", 0) or 0) * \
+            AUDIO_INPUT_COST_PER_1M / 1e6
+        cost += (getattr(inp, "text_tokens", 0) or 0) * \
+            TEXT_INPUT_COST_PER_1M / 1e6
+        cost += (getattr(inp, "image_tokens", 0) or 0) * \
+            IMAGE_INPUT_COST_PER_1M / 1e6
     if out:
-        cost += (getattr(out, "audio_tokens", 0) or 0) * AUDIO_OUTPUT_COST_PER_1M / 1e6
-        cost += (getattr(out, "text_tokens", 0) or 0) * TEXT_OUTPUT_COST_PER_1M / 1e6
+        cost += (getattr(out, "audio_tokens", 0) or 0) * \
+            AUDIO_OUTPUT_COST_PER_1M / 1e6
+        cost += (getattr(out, "text_tokens", 0) or 0) * \
+            TEXT_OUTPUT_COST_PER_1M / 1e6
     return cost
 
 
 class OpenaiRealtimeHandler(AsyncStreamHandler):
-    """An OpenAI realtime handler for fastrtc Stream."""
+    """An OpenAI realtime handler for fastrtc Stream.
+
+    Uses a local diarization + ASR pipeline (FasterWhisper + NeMo streaming
+    diarizer) for transcription instead of OpenAI's gpt-4o-transcribe.
+    Audio is NOT streamed to OpenAI; only diarized text is sent.
+    """
 
     def __init__(self, deps: ToolDependencies, gradio_mode: bool = False, instance_path: Optional[str] = None):
         """Initialize the handler."""
@@ -95,7 +137,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self.input_sample_rate = OPEN_AI_INPUT_SAMPLE_RATE
 
         self.connection: Any = None
-        self.output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]" = asyncio.Queue()
+        self.output_queue: "asyncio.Queue[Tuple[int, NDArray[np.int16]] | AdditionalOutputs]" = asyncio.Queue(
+        )
 
         self.last_activity_time = asyncio.get_event_loop().time()
         self.start_time = asyncio.get_event_loop().time()
@@ -118,7 +161,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         # Buffer for accumulating text deltas from the realtime API
         self._text_response_buffer: str = ""
 
-        # Debouncing for partial transcripts
+        # Debouncing for partial transcripts (from local ASR active hypotheses)
         self.partial_transcript_task: asyncio.Task[None] | None = None
         # sequence counter to prevent stale emissions
         self.partial_transcript_sequence: int = 0
@@ -138,16 +181,179 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._trailing_silence_chunks: int = 0
         self._since_trigger_chunks: int = 0
         self._segment_chunks: list[np.ndarray] = []
-        self._pre_buffer: collections.deque[np.ndarray] = collections.deque(maxlen=_PRE_CHUNKS_COUNT)
+        self._pre_buffer: collections.deque[np.ndarray] = collections.deque(
+            maxlen=_PRE_CHUNKS_COUNT)
         # Tracks whether a response is currently being streamed (so we can interrupt it)
         self._response_active: bool = False
         # True from the moment speech is detected until SmartTurn commits the turn.
         # Wider than _is_speaking: stays True during trailing-silence evaluation too.
         self._user_turn_active: bool = False
 
+        # ── Local diar+ASR pipeline state ─────────────────────────────────
+        self._diar_asr_pipe: DiarAsrPipeline | None = None
+        self._diar_asr_streamer: StreamingDiarAsrStreamer | None = None
+        self._pipeline_residual: np.ndarray = np.empty(0, dtype=np.float32)
+        self._pipeline_total_samples_pushed: int = 0
+        self._pipeline_wallclock_t0: float | None = None
+        self._event_poller_task: asyncio.Task[None] | None = None
+        # Buffer of confirmed turn texts from the pipeline event consumer
+        self._confirmed_turn_buffer: list[str] = []
+        # Set when the pipeline background init completes
+        self._pipeline_ready_event: asyncio.Event = asyncio.Event()
+
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
         return OpenaiRealtimeHandler(self.deps, self.gradio_mode, self.instance_path)
+
+    # ── Local pipeline lifecycle ──────────────────────────────────────────
+
+    def _init_pipeline(self) -> None:
+        """Build and warm up the local diar+ASR pipeline (blocking).
+
+        Called once from start_up via run_in_executor so the heavy CUDA
+        warmup doesn't block the event loop.
+        """
+        pipeline_logger.info(
+            "Building local diar+ASR pipeline (language=%s, num_spk=%d)...", _PIPELINE_LANGUAGE, _PIPELINE_NUM_SPK
+        )
+        self._diar_asr_pipe = build_diar_asr_pipeline(
+            max_duration_s=3600.0,
+            language=_PIPELINE_LANGUAGE,
+            num_spk=_PIPELINE_NUM_SPK,
+        )
+        pipeline_logger.info("Local diar+ASR pipeline built and warmed up")
+
+        self._diar_asr_streamer = StreamingDiarAsrStreamer(
+            self._diar_asr_pipe,
+            sample_rate=_PIPELINE_SR,
+            chunk_samples=_PIPELINE_CHUNK_SAMPLES,
+            diar_chunk_samples=_DIAR_CHUNK_SAMPLES,
+            max_seconds=_PIPELINE_MAX_SECONDS,
+        )
+
+        # Sync wall-clock reference for latency measurement
+        self._pipeline_wallclock_t0 = time.perf_counter()
+        coord = getattr(self._diar_asr_streamer, "coordinator", None)
+        if coord is not None and hasattr(coord, "stream_wallclock_t0"):
+            coord.stream_wallclock_t0 = self._pipeline_wallclock_t0
+
+        self._pipeline_residual = np.empty(0, dtype=np.float32)
+        self._pipeline_total_samples_pushed = 0
+
+    def _shutdown_pipeline(self) -> None:
+        """Gracefully shut down the local pipeline (blocking)."""
+        if self._diar_asr_streamer is not None:
+            try:
+                # Push final empty chunk to signal end-of-stream
+                self._diar_asr_streamer.push(
+                    self._pipeline_total_samples_pushed,
+                    np.empty(0, dtype=np.float32),
+                    is_final=True,
+                )
+                self._diar_asr_streamer.finalize()
+            except Exception as e:
+                logger.warning("Error finalizing diar+ASR streamer: %s", e)
+            self._diar_asr_streamer = None
+
+        if self._diar_asr_pipe is not None:
+            try:
+                self._diar_asr_pipe.close()
+            except Exception as e:
+                logger.warning("Error closing diar+ASR pipeline: %s", e)
+            self._diar_asr_pipe = None
+
+    def _push_audio_to_pipeline(self, audio_16k: np.ndarray) -> None:
+        """Feed 16 kHz float32 audio into the local diar+ASR pipeline.
+
+        Accumulates audio in a residual buffer and pushes complete chunks
+        to the streamer, mirroring the demo's main loop logic.
+
+        This method is meant to be called from the event loop via
+        run_in_executor (it's synchronous and may briefly block on the
+        diarizer queue).
+        """
+        if self._diar_asr_streamer is None:
+            return
+
+        self._pipeline_residual = np.concatenate(
+            [self._pipeline_residual, audio_16k])
+
+        while len(self._pipeline_residual) >= _PIPELINE_CHUNK_SAMPLES:
+            chunk = self._pipeline_residual[:_PIPELINE_CHUNK_SAMPLES]
+            self._pipeline_residual = self._pipeline_residual[_PIPELINE_CHUNK_SAMPLES:]
+
+            self._diar_asr_streamer.push(
+                self._pipeline_total_samples_pushed,
+                chunk,
+                is_final=False,
+            )
+            self._pipeline_total_samples_pushed += _PIPELINE_CHUNK_SAMPLES
+
+    async def _poll_pipeline_events(self) -> None:
+        """Background task that drains events from the diar+ASR pipeline streamer
+        and emits them as partial / confirmed transcripts.
+
+        Runs at ~50 Hz until shutdown is requested.
+        """
+        while not self._shutdown_requested:
+            if self._diar_asr_streamer is None:
+                await asyncio.sleep(_EVENT_POLL_INTERVAL_S)
+                continue
+
+            try:
+                events = self._diar_asr_streamer.poll_events()
+            except Exception as e:
+                logger.debug("Event poll error: %s", e)
+                await asyncio.sleep(_EVENT_POLL_INTERVAL_S)
+                continue
+
+            for ev in events:
+                kind = getattr(ev, "kind", None)
+                text = getattr(ev, "text", "")
+                meta = getattr(ev, "meta", None) or {}
+                spk = meta.get("speaker")
+
+                if not text:
+                    continue
+
+                spk_label = f"Speaker {
+                    spk + 1}" if spk is not None else "Unknown speaker"
+
+                if kind == "active":
+                    # Active hypothesis — emit as partial transcript for UI
+                    self.partial_transcript_sequence += 1
+                    current_seq = self.partial_transcript_sequence
+
+                    if self.partial_transcript_task and not self.partial_transcript_task.done():
+                        self.partial_transcript_task.cancel()
+                        try:
+                            await self.partial_transcript_task
+                        except asyncio.CancelledError:
+                            pass
+
+                    display_text = f"{spk_label} says: {text}"
+                    self.partial_transcript_task = asyncio.create_task(
+                        self._emit_debounced_partial(display_text, current_seq)
+                    )
+
+                elif kind == "confirmed_turn":
+                    # A speaker turn was flushed by the coordinator (e.g. on
+                    # speaker change).  Just buffer it — we only send to
+                    # OpenAI and the chatbot when SmartTurn says COMPLETE.
+                    turn_text = f"{spk_label} says: {text}"
+                    self._confirmed_turn_buffer.append(turn_text)
+                    logger.debug(
+                        "Pipeline confirmed turn buffered: %s", turn_text[:120])
+
+                elif kind == "confirmed":
+                    # Word-level confirmed text (intermediate). We don't send
+                    # these to OpenAI — we wait for confirmed_turn which
+                    # aggregates per-speaker. But log for debugging.
+                    logger.debug("Pipeline confirmed words: %s", text[:80])
+
+            await asyncio.sleep(_EVENT_POLL_INTERVAL_S)
+
+    # ── Personality ───────────────────────────────────────────────────────
 
     async def apply_personality(self, profile: str | None) -> str:
         """Apply a new personality (profile) at runtime if possible.
@@ -165,7 +371,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
             set_custom_profile(profile)
             logger.info(
-                "Set custom profile to %r (config=%r)", profile, getattr(_config, "REACHY_MINI_CUSTOM_PROFILE", None)
+                "Set custom profile to %r (config=%r)", profile, getattr(
+                    _config, "REACHY_MINI_CUSTOM_PROFILE", None)
             )
 
             try:
@@ -185,16 +392,19 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             "output_modalities": ["text"],
                         },
                     )
-                    logger.info("Applied personality via live update: %s", profile or "built-in default")
+                    logger.info("Applied personality via live update: %s",
+                                profile or "built-in default")
                 except Exception as e:
-                    logger.warning("Live update failed; will restart session: %s", e)
+                    logger.warning(
+                        "Live update failed; will restart session: %s", e)
 
                 # Force a real restart to guarantee the new instructions/voice
                 try:
                     await self._restart_session()
                     return "Applied personality and restarted realtime session."
                 except Exception as e:
-                    logger.warning("Failed to restart session after apply: %s", e)
+                    logger.warning(
+                        "Failed to restart session after apply: %s", e)
                     return "Applied personality. Will take effect on next connection."
             else:
                 logger.info(
@@ -234,15 +444,34 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 openai_api_key = config.OPENAI_API_KEY
         else:
             if not openai_api_key or not openai_api_key.strip():
-                # In headless console mode, LocalStream now blocks startup until the key is provided.
-                # However, unit tests may invoke this handler directly with a stubbed client.
-                # To keep tests hermetic without requiring a real key, fall back to a placeholder.
-                logger.warning("OPENAI_API_KEY missing. Proceeding with a placeholder (tests/offline).")
+                logger.warning(
+                    "OPENAI_API_KEY missing. Proceeding with a placeholder (tests/offline).")
                 openai_api_key = "DUMMY"
 
         self.client = AsyncOpenAI(api_key=openai_api_key)
 
         self._tts_worker.start()
+
+        # ── Initialize local diar+ASR pipeline in background ──────────────
+        # The pipeline warmup (CUDA kernels, model loading) is heavy and can
+        # take 10-30s.  We start it in a background thread and let the OpenAI
+        # session connect in parallel so the robot is "alive" sooner.
+        # Audio will simply be discarded until _diar_asr_streamer is ready.
+        loop = asyncio.get_event_loop()
+        self._pipeline_ready_event = asyncio.Event()
+
+        async def _init_pipeline_bg() -> None:
+            pipeline_logger.info(
+                "Initializing local diar+ASR pipeline in background thread...")
+            await loop.run_in_executor(None, self._init_pipeline)
+            pipeline_logger.info("Local diar+ASR pipeline ready")
+            self._pipeline_ready_event.set()
+
+        asyncio.create_task(_init_pipeline_bg(), name="diar-asr-init")
+
+        # Start the background event poller for pipeline transcription events
+        self._event_poller_task = asyncio.create_task(
+            self._poll_pipeline_events(), name="diar-asr-event-poller")
 
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
@@ -252,7 +481,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 return
             except ConnectionClosedError as e:
                 # Abrupt close (e.g., "no close frame received or sent") → retry
-                logger.warning("Realtime websocket closed unexpectedly (attempt %d/%d): %s", attempt, max_attempts, e)
+                logger.warning(
+                    "Realtime websocket closed unexpectedly (attempt %d/%d): %s", attempt, max_attempts, e)
                 if attempt < max_attempts:
                     # exponential backoff with jitter
                     base_delay = 2 ** (attempt - 1)  # 1s, 2s, 4s, 8s, etc.
@@ -286,7 +516,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
             # Ensure we have a client (start_up must have run once)
             if getattr(self, "client", None) is None:
-                logger.warning("Cannot restart: OpenAI client not initialized yet.")
+                logger.warning(
+                    "Cannot restart: OpenAI client not initialized yet.")
                 return
 
             # Fire-and-forget new session and wait briefly for connection
@@ -294,17 +525,23 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 self._connected_event.clear()
             except Exception:
                 pass
-            asyncio.create_task(self._run_realtime_session(), name="openai-realtime-restart")
+            asyncio.create_task(self._run_realtime_session(),
+                                name="openai-realtime-restart")
             try:
                 await asyncio.wait_for(self._connected_event.wait(), timeout=5.0)
                 logger.info("Realtime session restarted and connected.")
             except asyncio.TimeoutError:
-                logger.warning("Realtime session restart timed out; continuing in background.")
+                logger.warning(
+                    "Realtime session restart timed out; continuing in background.")
         except Exception as e:
             logger.warning("_restart_session failed: %s", e)
 
     async def _run_realtime_session(self) -> None:
-        """Establish and manage a single realtime session."""
+        """Establish and manage a single realtime session.
+
+        Since we no longer stream audio to OpenAI, the session is configured
+        as text-only input (no audio input, no transcription, no server VAD).
+        """
         async with self.client.realtime.connect(model=config.MODEL_NAME) as conn:
             try:
                 await conn.session.update(
@@ -312,37 +549,21 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         "type": "realtime",
                         "instructions": get_session_instructions(),
                         "output_modalities": ["text"],
-                        "audio": {
-                            "input": {
-                                "format": {
-                                    "type": "audio/pcm",
-                                    "rate": self.input_sample_rate,
-                                },
-                                "transcription": {"model": "gpt-4o-transcribe", "language": "en"},
-                                # Use server_vad for speech events and auto-commit, but disable
-                                # auto-responses entirely — SmartTurn decides when to respond.
-                                "turn_detection": {
-                                    "type": "server_vad",
-                                    "create_response": False,
-                                    "interrupt_response": False,
-                                },
-                            },
-                        },
-                        # type: ignore[typeddict-item]
+                        # No audio input config — we send diarized text only.
+                        # No turn_detection — SmartTurn handles this locally.
                         "tools": get_tool_specs(),
                         "tool_choice": "auto",
                     },
                 )
                 logger.info(
-                    "Realtime session initialized with profile=%r voice=%r",
+                    "Realtime session initialized (text-only input) with profile=%r",
                     getattr(config, "REACHY_MINI_CUSTOM_PROFILE", None),
-                    get_session_voice(),
                 )
-                # If we reached here, the session update succeeded which implies the API key worked.
-                # Persist the key to a newly created .env (copied from .env.example) if needed.
+                # Persist the key to a newly created .env if needed.
                 self._persist_api_key_if_needed()
             except Exception:
-                logger.exception("Realtime session.update failed; aborting startup")
+                logger.exception(
+                    "Realtime session.update failed; aborting startup")
                 return
 
             logger.info("Realtime session updated successfully")
@@ -352,7 +573,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             self._vad_residual = np.empty(0, dtype=np.float32)
             self._response_active = False
 
-            # Manage event received from the openai server
+            # Manage events received from the openai server
             self.connection = conn
             try:
                 self._connected_event.set()
@@ -361,34 +582,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             async for event in self.connection:
                 logger.debug(f"OpenAI event: {event.type}")
 
-                if event.type == "input_audio_buffer.speech_started":
-                    # Interrupt any active response when user starts speaking
-                    if self._response_active:
-                        try:
-                            await self.connection.response.cancel()
-                        except Exception as e:
-                            logger.debug("Could not cancel response on speech_started: %s", e)
-                        if hasattr(self, "_clear_queue") and callable(self._clear_queue):
-                            self._clear_queue()
-                        self._text_response_buffer = ""
-                        self._vad_residual = np.empty(0, dtype=np.float32)
-                    if self.deps.head_wobbler is not None:
-                        self.deps.head_wobbler.reset()
-                    self.deps.movement_manager.set_listening(True)
-                    logger.debug("SmartTurn: server VAD speech_started")
-
-                if event.type == "input_audio_buffer.speech_stopped":
-                    # Server VAD detected end-of-speech and auto-committed the buffer.
-                    # Now run SmartTurn inference to decide whether to actually respond.
-                    logger.debug("SmartTurn: server VAD speech_stopped — scheduling inference")
-                    asyncio.create_task(self._evaluate_turn_endpoint(), name="smart-turn-eval")
-
+                # NOTE: No more input_audio_buffer.speech_started / speech_stopped
+                # events — SmartTurn is fully local now and triggers via receive().
 
                 if event.type in (
-                    "response.audio.done",  # GA
-                    "response.output_audio.done",  # GA alias
-                    "response.audio.completed",  # legacy (for safety)
-                    "response.completed",  # text-only completion
+                    "response.audio.done",
+                    "response.output_audio.done",
+                    "response.audio.completed",
+                    "response.completed",
                 ):
                     logger.debug("response completed")
                     self._response_active = False
@@ -398,76 +599,41 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     self._response_active = True
 
                 if event.type == "response.done":
-                    # Doesn't mean the audio is done playing
                     logger.debug("Response done")
                     self._response_active = False
 
                     response = getattr(event, "response", None)
-                    usage = getattr(response, "usage", None) if response else None
+                    usage = getattr(response, "usage",
+                                    None) if response else None
                     if usage:
                         cost = _compute_response_cost(usage)
                         self.cumulative_cost += cost
-                        logger.debug("Cost: $%.4f | Cumulative: $%.4f", cost, self.cumulative_cost)
+                        logger.debug("Cost: $%.4f | Cumulative: $%.4f",
+                                     cost, self.cumulative_cost)
                     else:
-                        logger.warning("No usage data available for cost tracking")
-
-                # Handle partial transcription (user speaking in real-time)
-                if event.type == "conversation.item.input_audio_transcription.partial":
-                    logger.debug(f"User partial transcript: {event.transcript}")
-
-                    # Increment sequence
-                    self.partial_transcript_sequence += 1
-                    current_sequence = self.partial_transcript_sequence
-
-                    # Cancel previous debounce task if it exists
-                    if self.partial_transcript_task and not self.partial_transcript_task.done():
-                        self.partial_transcript_task.cancel()
-                        try:
-                            await self.partial_transcript_task
-                        except asyncio.CancelledError:
-                            pass
-
-                    # Start new debounce timer with sequence number
-                    self.partial_transcript_task = asyncio.create_task(
-                        self._emit_debounced_partial(event.transcript, current_sequence)
-                    )
-
-                # Handle completed transcription (user finished speaking)
-                if event.type == "conversation.item.input_audio_transcription.completed":
-                    logger.debug(f"User transcript: {event.transcript}")
-
-                    # Cancel any pending partial emission
-                    if self.partial_transcript_task and not self.partial_transcript_task.done():
-                        self.partial_transcript_task.cancel()
-                        try:
-                            await self.partial_transcript_task
-                        except asyncio.CancelledError:
-                            pass
-
-                    await self.output_queue.put(AdditionalOutputs({"role": "user", "content": event.transcript}))
-
-                # Handle assistant transcription
-                if event.type in ("response.audio_transcript.done", "response.output_audio_transcript.done"):
-                    logger.debug(f"Assistant transcript: {event.transcript}")
-                    await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": event.transcript}))
+                        logger.warning(
+                            "No usage data available for cost tracking")
 
                 # Handle text delta – accumulate tokens into a buffer
                 if event.type in ("response.text.delta", "response.output_text.delta"):
                     self._text_response_buffer += event.delta
                     self.last_activity_time = asyncio.get_event_loop().time()
-                    logger.debug("Text delta received, buffer length: %d", len(self._text_response_buffer))
+                    logger.debug("Text delta received, buffer length: %d", len(
+                        self._text_response_buffer))
 
                 # Handle text completion – flush accumulated text to TTS worker
                 if event.type in ("response.text.done", "response.output_text.done"):
                     full_text = self._text_response_buffer.strip()
                     self._text_response_buffer = ""
                     if full_text:
-                        logger.info("Sending to TTS worker: %s", full_text[:80])
+                        logger.info("Sending to TTS worker: %s",
+                                    full_text[:80])
                         await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": full_text}))
                         if self._tts_worker is not None:
                             self._tts_worker.say(full_text)
                         self.last_activity_time = asyncio.get_event_loop().time()
-                        logger.debug("last activity time updated to %s", self.last_activity_time)
+                        logger.debug(
+                            "last activity time updated to %s", self.last_activity_time)
 
                 # ---- tool-calling plumbing ----
                 if event.type == "response.function_call_arguments.done":
@@ -476,12 +642,14 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     call_id = getattr(event, "call_id", None)
 
                     if not isinstance(tool_name, str) or not isinstance(args_json_str, str):
-                        logger.error("Invalid tool call: tool_name=%s, args=%s", tool_name, args_json_str)
+                        logger.error(
+                            "Invalid tool call: tool_name=%s, args=%s", tool_name, args_json_str)
                         continue
 
                     try:
                         tool_result = await dispatch_tool_call(tool_name, args_json_str, self.deps)
-                        logger.debug("Tool '%s' executed successfully", tool_name)
+                        logger.debug(
+                            "Tool '%s' executed successfully", tool_name)
                         logger.debug("Tool result: %s", tool_result)
                     except Exception as e:
                         logger.error("Tool '%s' failed", tool_name)
@@ -508,10 +676,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     )
 
                     if tool_name == "camera" and "b64_im" in tool_result:
-                        # use raw base64, don't json.dumps (which adds quotes)
                         b64_im = tool_result["b64_im"]
                         if not isinstance(b64_im, str):
-                            logger.warning("Unexpected type for b64_im: %s", type(b64_im))
+                            logger.warning(
+                                "Unexpected type for b64_im: %s", type(b64_im))
                             b64_im = str(b64_im)
                         await self.connection.conversation.item.create(
                             item={
@@ -530,8 +698,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         if self.deps.camera_worker is not None:
                             np_img = self.deps.camera_worker.get_latest_frame()
                             if np_img is not None:
-                                # Camera frames are BGR from OpenCV; convert so Gradio displays correct colors.
-                                rgb_frame = cv2.cvtColor(np_img, cv2.COLOR_BGR2RGB)
+                                rgb_frame = cv2.cvtColor(
+                                    np_img, cv2.COLOR_BGR2RGB)
                             else:
                                 rgb_frame = None
                             img = gr.Image(value=rgb_frame)
@@ -546,12 +714,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             )
 
                     # if this tool call was triggered by an idle signal, don't make the robot speak
-                    # for other tool calls, let the robot reply out loud — but only if the user
-                    # isn't currently speaking (SmartTurn may be mid-evaluation)
                     if self.is_idle_tool_call:
                         self.is_idle_tool_call = False
                     elif self._user_turn_active:
-                        logger.debug("SmartTurn: skipping post-tool response.create() — user turn in progress")
+                        logger.debug(
+                            "SmartTurn: skipping post-tool response.create() — user turn in progress")
                     else:
                         await self.connection.response.create(
                             response={
@@ -559,32 +726,36 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             },
                         )
 
-                    # re synchronize the head wobble after a tool call that may have taken some time
                     if self.deps.head_wobbler is not None:
                         self.deps.head_wobbler.reset()
 
                 # server error
                 if event.type == "error":
                     err = getattr(event, "error", None)
-                    msg = getattr(err, "message", str(err) if err else "unknown error")
+                    msg = getattr(err, "message", str(
+                        err) if err else "unknown error")
                     code = getattr(err, "code", "")
 
-                    logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
+                    logger.error(
+                        "Realtime error [%s]: %s (raw=%s)", code, msg, err)
 
-                    # Only show user-facing errors, not internal state errors
                     if code not in ("input_audio_buffer_commit_empty", "conversation_already_has_active_response"):
                         await self.output_queue.put(
-                            AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
+                            AdditionalOutputs(
+                                {"role": "assistant", "content": f"[error] {msg}"})
                         )
 
-    # Microphone receive
+    # ── Microphone receive ────────────────────────────────────────────────
+
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
-        """Receive audio frame from the microphone, send it to OpenAI, and run
-        the SmartTurn VAD pipeline to determine when to commit the turn.
+        """Receive audio frame from the microphone.
 
-        Args:
-            frame: A tuple containing (sample_rate, audio_data).
-
+        Audio is NO LONGER sent to OpenAI. Instead it is:
+        1. Resampled to 16 kHz and fed into the local diar+ASR pipeline.
+        2. Processed by Silero VAD + SmartTurn to detect turn endpoints.
+        When SmartTurn detects a complete utterance, the accumulated
+        diarized transcript is sent to OpenAI as an input_text message
+        and a response is requested.
         """
         if not self.connection:
             return
@@ -593,31 +764,21 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         # Reshape if needed
         if audio_frame.ndim == 2:
-            # Scipy channels last convention
             if audio_frame.shape[1] > audio_frame.shape[0]:
                 audio_frame = audio_frame.T
-            # Multiple channels -> Mono channel
             if audio_frame.shape[1] > 1:
                 audio_frame = audio_frame[:, 0]
 
-        # Resample to OpenAI rate if needed
-        if self.input_sample_rate != input_sample_rate:
-            audio_frame = resample(audio_frame, int(len(audio_frame) * self.input_sample_rate / input_sample_rate))
-
-        # Cast if needed
+        # Cast to int16 if needed (fastrtc convention)
         audio_frame = audio_to_int16(audio_frame)
 
-        # Send to OpenAI (guard against races during reconnect)
-        try:
-            audio_message = base64.b64encode(audio_frame.tobytes()).decode("utf-8")
-            await self.connection.input_audio_buffer.append(audio=audio_message)
-        except Exception as e:
-            logger.debug("Dropping audio frame: connection not ready (%s)", e)
-            return
+        # ── Resample to 16 kHz float32 for local pipeline + VAD ───────────
+        vad_block = self._resample_to_16k(audio_frame, input_sample_rate)
 
         # ── SmartTurn VAD pipeline ────────────────────────────────────────
-        # Resample the same frame to 16 kHz float32 for Silero VAD + SmartTurn
-        vad_block = self._resample_to_16k(audio_frame, self.input_sample_rate)
+        # NOTE: Audio is only fed to the diar+ASR pipeline when the VAD
+        # detects speech, not continuously. This avoids wasting GPU on
+        # silence and matches the demo's behaviour.
         self._vad_residual = np.concatenate([self._vad_residual, vad_block])
 
         while len(self._vad_residual) >= _SILERO_CHUNK:
@@ -637,6 +798,13 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     self._segment_chunks = list(self._pre_buffer)
                     self._segment_chunks.append(vad_chunk)
 
+                    # Feed the pre-roll + first speech chunk to the pipeline
+                    preroll_audio = np.concatenate(self._segment_chunks)
+                    if len(preroll_audio) > _PREROLL_SAMPLES:
+                        preroll_audio = preroll_audio[-_PREROLL_SAMPLES:]
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, self._push_audio_to_pipeline, preroll_audio)
+
                     # Interrupt any active response
                     if self._response_active:
                         try:
@@ -650,22 +818,42 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     if self.deps.head_wobbler is not None:
                         self.deps.head_wobbler.reset()
                     self.deps.movement_manager.set_listening(True)
-                    logger.info("SmartTurn: speech detected, accumulating segment")
+                    pipeline_logger.info(
+                        "SmartTurn: speech detected, accumulating segment")
 
             else:
                 self._segment_chunks.append(vad_chunk)
                 self._since_trigger_chunks += 1
 
+                # Feed speech audio to the pipeline
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, self._push_audio_to_pipeline, vad_chunk)
+
                 if is_speech:
                     self._trailing_silence_chunks = 0
                 else:
                     self._trailing_silence_chunks += 1
-                # Note: _evaluate_turn_endpoint() is triggered by the server's
-                # speech_stopped event, not by the silence counter here.
+
+                # ── Silence-based endpoint detection (fully local) ────────
+                # Previously triggered by server VAD's speech_stopped event.
+                # Now we detect it ourselves from the silence counter,
+                # matching the demo's logic.
+                if self._trailing_silence_chunks >= _STOP_CHUNKS or self._since_trigger_chunks >= _MAX_SPEECH_CHUNKS:
+                    asyncio.create_task(
+                        self._evaluate_turn_endpoint(), name="smart-turn-eval")
+                    # Reset trailing silence so we don't re-trigger immediately
+                    # while SmartTurn is evaluating.
+                    self._trailing_silence_chunks = 0
 
     async def _evaluate_turn_endpoint(self) -> None:
         """Run SmartTurn inference on the accumulated segment and commit the turn
         if the model predicts the utterance is complete.
+
+        When the turn is complete:
+        1. Flush the current speaker turn in the pipeline coordinator.
+        2. Collect confirmed turn text from the event buffer.
+        3. Send the diarized text to OpenAI as an input_text user message.
+        4. Request a response from OpenAI.
         """
         if not self._segment_chunks:
             logger.debug("SmartTurn: no segment audio, skipping evaluation")
@@ -675,10 +863,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         segment_audio = np.concatenate(self._segment_chunks, dtype=np.float32)
         seg_dur = len(segment_audio) / _SMART_TURN_SR
 
-        # OpenAI requires at least 100ms of audio in the buffer — skip inference and bail
-        # early if the segment is too short (likely a noise blip, not real speech)
+        # Skip very short segments (noise blips)
         if seg_dur < 0.1:
-            logger.debug("SmartTurn: segment too short (%.0fms), ignoring", seg_dur * 1000)
+            logger.debug(
+                "SmartTurn: segment too short (%.0fms), ignoring", seg_dur * 1000)
             self._reset_vad_state()
             return
 
@@ -686,34 +874,107 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(None, predict_endpoint, segment_audio)
         except Exception as e:
-            logger.warning("SmartTurn inference failed: %s – committing turn anyway", e)
+            logger.warning(
+                "SmartTurn inference failed: %s – committing turn anyway", e)
             result = {"prediction": 1, "probability": float("nan")}
 
         pred = result.get("prediction", 0)
         prob = result.get("probability", float("nan"))
         label = "COMPLETE  ✓" if pred == 1 else "incomplete ↩"
-        logger.info("SmartTurn: %s (p=%.3f, dur=%.2fs)", label, prob, seg_dur)
+        pipeline_logger.info(
+            "SmartTurn: %s (p=%.3f, dur=%.2fs)", label, prob, seg_dur)
 
         if pred == 1:
-            # Turn is complete — the server already committed the buffer on speech_stopped,
-            # so just request a response.
+            # ── Turn is complete — flush pipeline and send text to OpenAI ──
             self.deps.movement_manager.set_listening(False)
-            logger.info("SmartTurn: committing buffer and requesting response")
+            pipeline_logger.info(
+                "SmartTurn: turn complete — flushing pipeline and sending to OpenAI")
 
-            # Reset VAD state first so new speech can be detected immediately
+            # 1. Flush the current speaker turn in the pipeline coordinator
+            if self._diar_asr_streamer is not None:
+                coord = getattr(self._diar_asr_streamer, "coordinator", None)
+                if coord is not None:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: coord.flush_current_turn(is_final=False)
+                    )
+
+            # 2. Give the event poller a moment to drain the freshly flushed events
+            await asyncio.sleep(0.05)
+
+            # 3. Drain any remaining events right now
+            if self._diar_asr_streamer is not None:
+                try:
+                    late_events = self._diar_asr_streamer.poll_events()
+                    for ev in late_events:
+                        kind = getattr(ev, "kind", None)
+                        text = getattr(ev, "text", "")
+                        meta = getattr(ev, "meta", None) or {}
+                        spk = meta.get("speaker")
+                        if kind == "confirmed_turn" and text:
+                            spk_label = f"Speaker {
+                                spk + 1}" if spk is not None else "Unknown speaker"
+                            turn_text = f"{spk_label} says: {
+                                ' '.join(text.split())}"
+                            self._confirmed_turn_buffer.append(turn_text)
+                            await self.output_queue.put(AdditionalOutputs({"role": "user", "content": turn_text}))
+                except Exception as e:
+                    logger.debug("Late event drain error: %s", e)
+
+            # 4. Collect all confirmed turn text accumulated since last commit
+            if self._confirmed_turn_buffer:
+                # Normalize whitespace (hypothesis buffer can produce double spaces)
+                combined_text = "\n".join(" ".join(line.split())
+                                          for line in self._confirmed_turn_buffer)
+                self._confirmed_turn_buffer.clear()
+
+                # Cancel any pending partial transcript
+                if self.partial_transcript_task and not self.partial_transcript_task.done():
+                    self.partial_transcript_task.cancel()
+                    try:
+                        await self.partial_transcript_task
+                    except asyncio.CancelledError:
+                        pass
+
+                # Emit to Gradio chatbot as a completed user message
+                await self.output_queue.put(AdditionalOutputs({"role": "user", "content": combined_text}))
+                pipeline_logger.info(
+                    "Pipeline confirmed turn: %s", combined_text[:120])
+
+                # 5. Send to OpenAI as an input_text user message
+                try:
+                    await self.connection.conversation.item.create(
+                        item={
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": combined_text}],
+                        },
+                    )
+                    pipeline_logger.info(
+                        "Sent diarized text to OpenAI: %s", combined_text[:120])
+                except Exception as e:
+                    logger.warning(
+                        "Failed to send diarized text to OpenAI: %s", e)
+            else:
+                logger.debug(
+                    "SmartTurn: turn complete but no confirmed text to send")
+
+            # Reset VAD state so new speech can be detected immediately
             self._reset_vad_state()
 
-            # Only create a response if one isn't already running
+            # 6. Request a response (only if one isn't already running)
             if self._response_active:
-                logger.debug("SmartTurn: response already active, skipping response.create()")
+                logger.debug(
+                    "SmartTurn: response already active, skipping response.create()")
                 return
             try:
                 await self.connection.response.create()
             except Exception as e:
                 logger.warning("SmartTurn: failed to create response: %s", e)
         else:
-            # Incomplete utterance — keep listening, reset trailing silence counter
-            logger.info("SmartTurn: utterance incomplete, waiting for more speech (p=%.3f, dur=%.2fs so far)", prob, seg_dur)
+            # Incomplete utterance — keep listening
+            pipeline_logger.info(
+                "SmartTurn: utterance incomplete, waiting for more speech (p=%.3f, dur=%.2fs so far)", prob, seg_dur
+            )
             self._trailing_silence_chunks = 0
 
     def _reset_vad_state(self) -> None:
@@ -738,26 +999,32 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     async def emit(self) -> Tuple[int, NDArray[np.int16]] | AdditionalOutputs | None:
         """Emit audio frame to be played by the speaker."""
-        # sends to the stream the stuff put in the output queue by the openai event handler
-        # This is called periodically by the fastrtc Stream
-
         # Handle idle
         idle_duration = asyncio.get_event_loop().time() - self.last_activity_time
         if idle_duration > 15.0 and self.deps.movement_manager.is_idle():
             try:
                 await self.send_idle_signal(idle_duration)
             except Exception as e:
-                logger.warning("Idle signal skipped (connection closed?): %s", e)
+                logger.warning(
+                    "Idle signal skipped (connection closed?): %s", e)
                 return None
 
-            self.last_activity_time = asyncio.get_event_loop().time()  # avoid repeated resets
+            self.last_activity_time = asyncio.get_event_loop().time()
 
-        # type: ignore[no-any-return]
         return await wait_for_item(self.output_queue)
 
     async def shutdown(self) -> None:
         """Shutdown the handler."""
         self._shutdown_requested = True
+
+        # Cancel event poller
+        if self._event_poller_task and not self._event_poller_task.done():
+            self._event_poller_task.cancel()
+            try:
+                await self._event_poller_task
+            except asyncio.CancelledError:
+                pass
+
         # Cancel any pending debounce task
         if self.partial_transcript_task and not self.partial_transcript_task.done():
             self.partial_transcript_task.cancel()
@@ -785,6 +1052,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         self._tts_worker.stop()
 
+        # Shut down local diar+ASR pipeline (blocking; run in executor)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._shutdown_pipeline)
+
     def format_timestamp(self) -> str:
         """Format current timestamp with date, time, and elapsed seconds."""
         loop_time = asyncio.get_event_loop().time()  # monotonic
@@ -793,13 +1064,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         return f"[{dt.strftime('%Y-%m-%d %H:%M:%S')} | +{elapsed_seconds:.1f}s]"
 
     async def get_available_voices(self) -> list[str]:
-        """Try to discover available voices for the configured realtime model.
-
-        Attempts to retrieve model metadata from the OpenAI Models API and look
-        for any keys that might contain voice names. Falls back to a curated
-        list known to work with realtime if discovery fails.
-        """
-        # Conservative fallback list with default first
+        """Try to discover available voices for the configured realtime model."""
         fallback = [
             "cedar",
             "alloy",
@@ -810,9 +1075,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             "coral",
         ]
         try:
-            # Best effort discovery; safe-guarded for unexpected shapes
             model = await self.client.models.retrieve(config.MODEL_NAME)
-            # Try common serialization paths
             raw = None
             for attr in ("model_dump", "to_dict"):
                 fn = getattr(model, attr, None)
@@ -827,7 +1090,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     raw = dict(model)
                 except Exception:
                     raw = None
-            # Scan for voice candidates
             candidates: set[str] = set()
 
             def _collect(obj: object) -> None:
@@ -851,7 +1113,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
             if isinstance(raw, dict):
                 _collect(raw)
-            # Ensure default present and stable order
             voices = sorted(candidates) if candidates else fallback
             if "cedar" not in voices:
                 voices = ["cedar", *[v for v in voices if v != "cedar"]]
@@ -883,43 +1144,40 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         )
 
     def _persist_api_key_if_needed(self) -> None:
-        """Persist the API key into `.env` inside `instance_path/` when appropriate.
-
-        - Only runs in Gradio mode when key came from the textbox and is non-empty.
-        - Only saves if `self.instance_path` is not None.
-        - Writes `.env` to `instance_path/.env` (does not overwrite if it already exists).
-        - If `instance_path/.env.example` exists, copies its contents while overriding OPENAI_API_KEY.
-        """
+        """Persist the API key into `.env` inside `instance_path/` when appropriate."""
         try:
             if not self.gradio_mode:
-                logger.warning("Not in Gradio mode; skipping API key persistence.")
+                logger.warning(
+                    "Not in Gradio mode; skipping API key persistence.")
                 return
 
             if self._key_source != "textbox":
-                logger.info("API key not provided via textbox; skipping persistence.")
+                logger.info(
+                    "API key not provided via textbox; skipping persistence.")
                 return
 
             key = (self._provided_api_key or "").strip()
             if not key:
-                logger.warning("No API key provided via textbox; skipping persistence.")
+                logger.warning(
+                    "No API key provided via textbox; skipping persistence.")
                 return
             if self.instance_path is None:
-                logger.warning("Instance path is None; cannot persist API key.")
+                logger.warning(
+                    "Instance path is None; cannot persist API key.")
                 return
 
-            # Update the current process environment for downstream consumers
             try:
                 import os
 
                 os.environ["OPENAI_API_KEY"] = key
-            except Exception:  # best-effort
+            except Exception:
                 pass
 
             target_dir = Path(self.instance_path)
             env_path = target_dir / ".env"
             if env_path.exists():
-                # Respect existing user configuration
-                logger.info(".env already exists at %s; not overwriting.", env_path)
+                logger.info(
+                    ".env already exists at %s; not overwriting.", env_path)
                 return
 
             example_path = target_dir / ".env.example"
@@ -929,9 +1187,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     content = example_path.read_text(encoding="utf-8")
                     content_lines = content.splitlines()
                 except Exception as e:
-                    logger.warning("Failed to read .env.example at %s: %s", example_path, e)
+                    logger.warning(
+                        "Failed to read .env.example at %s: %s", example_path, e)
 
-            # Replace or append the OPENAI_API_KEY line
             replaced = False
             for i, line in enumerate(content_lines):
                 if line.strip().startswith("OPENAI_API_KEY="):
@@ -941,10 +1199,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             if not replaced:
                 content_lines.append(f"OPENAI_API_KEY={key}")
 
-            # Ensure file ends with newline
             final_text = "\n".join(content_lines) + "\n"
             env_path.write_text(final_text, encoding="utf-8")
-            logger.info("Created %s and stored OPENAI_API_KEY for future runs.", env_path)
+            logger.info(
+                "Created %s and stored OPENAI_API_KEY for future runs.", env_path)
         except Exception as e:
-            # Never crash the app for QoL persistence; just log.
             logger.warning("Could not persist OPENAI_API_KEY to .env: %s", e)

@@ -38,4 +38,5 @@
 *.vis lfs
 *.db lfs
 *.ply lfs
-*.onnx lfs 
+*.onnx lfs
+*.nemo lfs

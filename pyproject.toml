@@ -16,13 +16,10 @@ dependencies = [
     "gradio==5.50.1.dev1",
     "huggingface-hub==1.3.0",
     "opencv-python>=4.12.0.88",
-
     #Environment variables
     "python-dotenv",
-
     #OpenAI
     "openai>=2.1",
-
     # Vision
     "torch==2.8.0",
     "torchvision==0.23.0",
@@ -30,13 +27,14 @@ dependencies = [
     "flash-attn",
     "pedalboard",
     "piper-tts",
-
+    "faster-whisper",
     #Reachy mini
     "reachy_mini_dances_library",
     "reachy_mini_toolbox",
     "reachy-mini>=1.3.1",
     "eclipse-zenoh~=1.7.0",
     "gradio_client>=1.13.3",
+    "nemo-toolkit[asr]",
 ]
 
 [tool.uv.extra-build-dependencies]
@@ -63,6 +61,7 @@ torchaudio = [
 flash-attn = [
   { git = "https://github.com/Dao-AILab/flash-attention", tag = "v2.8.3" },
 ]
+nemo-toolkit = { git = "https://github.com/NVIDIA-NeMo/NeMo.git", rev = "update_transformers" }
 
 [[tool.uv.index]]
 name = "pytorch-cu129"
@@ -82,15 +81,11 @@ yolo_vision = [
   "ultralytics",
   "supervision",
 ]
-mediapipe_vision = [
-  "mediapipe==0.10.14",
-]
 all_vision = [
   "transformers==5.0.0rc2",
   "num2words",
   "ultralytics",
   "supervision",
-  "mediapipe==0.10.14",
 ]
 
 [dependency-groups]
