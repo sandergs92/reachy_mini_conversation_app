@@ -256,6 +256,20 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     async def _run_realtime_session(self) -> None:
         """Establish and manage a single realtime session."""
+
+        def _get_full_instructions() -> str:
+            instructions = get_session_instructions()
+            state = self.deps.creative_session_state
+            if state:
+                instructions += (
+                    "\n\n[ACTIVE CREATIVE SESSION STATE]\n"
+                    f"- SCENE: {state.get('scene', '')}\n"
+                    f"- TONE & STYLE: {state.get('tone_and_style', '')}\n"
+                    f"- IMMEDIATE EXPRESSION: {state.get('immediate_expression', '')}\n"
+                    "[END CREATIVE SESSION STATE]"
+                )
+            return instructions
+
         async with self.client.realtime.connect(model=config.MODEL_NAME) as conn:
             try:
                 await conn.session.update(
@@ -477,21 +491,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
                     if tool_name == "creative_direction_tool" and "error" not in tool_result:
                         try:
-                            updated_instructions = get_session_instructions()
-                            state = self.deps.creative_session_state
-                            if state:
-                                creative_block = (
-                                    "\n\n[ACTIVE CREATIVE SESSION STATE]\n"
-                                    f"- SCENE: {state.get('scene', '')}\n"
-                                    f"- TONE & STYLE: {state.get('tone_and_style', '')}\n"
-                                    f"- IMMEDIATE EXPRESSION: {state.get('immediate_expression', '')}\n"
-                                    "[END CREATIVE SESSION STATE]"
-                                )
-                                updated_instructions += creative_block
                             await self.connection.session.update(
                                 session={
                                     "type": "realtime",
-                                    "instructions": updated_instructions,
+                                    "instructions": _get_full_instructions(),
                                 },
                             )
                             logger.info("Session instructions updated with creative direction")
@@ -504,7 +507,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         self.is_idle_tool_call = False
                     else:
                         await self.connection.response.create(
-                            response={},
+                            response={
+                                "instructions": _get_full_instructions() + "\n\nUse the tool result just returned and answer concisely in speech.",
+                            },
                         )
 
                     # re synchronize the head wobble after a tool call that may have taken some time
