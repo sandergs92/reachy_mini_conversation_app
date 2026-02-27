@@ -23,6 +23,12 @@ dependencies = [
     #OpenAI
     "openai>=2.1",
 
+    # Vision
+    "torch==2.8.0",
+    "torchvision==0.23.0",
+    "torchaudio==2.8.0",
+    "flash-attn",
+
     #Reachy mini
     "reachy_mini_dances_library",
     "reachy_mini_toolbox",
@@ -30,6 +36,36 @@ dependencies = [
     "eclipse-zenoh~=1.7.0",
     "gradio_client>=1.13.3",
 ]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = [{ requirement = "torch", match-runtime = true }]
+
+[tool.uv.extra-build-variables]
+flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE" }
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn"
+version = "2.8.3"
+requires-dist = ["torch", "einops"]
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+]
+torchaudio = [
+  { index = "pytorch-cu129", marker = "sys_platform == 'linux'" },
+]
+flash-attn = [
+  { git = "https://github.com/Dao-AILab/flash-attention", tag = "v2.8.3" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
 
 [project.optional-dependencies]
 reachy_mini_wireless = [

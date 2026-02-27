@@ -58,6 +58,7 @@ class ToolDependencies:
     vision_manager: Any | None = None
     head_wobbler: Any | None = None  # HeadWobbler for audio-reactive motion
     motion_duration_s: float = 1.0
+    creative_session_state: Dict[str, str] | None = None
 
 
 # Tool base class

@@ -475,15 +475,36 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                 ),
                             )
 
+                    if tool_name == "creative_direction_tool" and "error" not in tool_result:
+                        try:
+                            updated_instructions = get_session_instructions()
+                            state = self.deps.creative_session_state
+                            if state:
+                                creative_block = (
+                                    "\n\n[ACTIVE CREATIVE SESSION STATE]\n"
+                                    f"- SCENE: {state.get('scene', '')}\n"
+                                    f"- TONE & STYLE: {state.get('tone_and_style', '')}\n"
+                                    f"- IMMEDIATE EXPRESSION: {state.get('immediate_expression', '')}\n"
+                                    "[END CREATIVE SESSION STATE]"
+                                )
+                                updated_instructions += creative_block
+                            await self.connection.session.update(
+                                session={
+                                    "type": "realtime",
+                                    "instructions": updated_instructions,
+                                },
+                            )
+                            logger.info("Session instructions updated with creative direction")
+                        except Exception as e:
+                            logger.warning("Failed to update session with creative direction: %s", e)
+
                     # if this tool call was triggered by an idle signal, don't make the robot speak
                     # for other tool calls, let the robot reply out loud
                     if self.is_idle_tool_call:
                         self.is_idle_tool_call = False
                     else:
                         await self.connection.response.create(
-                            response={
-                                "instructions": "Use the tool result just returned and answer concisely in speech.",
-                            },
+                            response={},
                         )
 
                     # re synchronize the head wobble after a tool call that may have taken some time
