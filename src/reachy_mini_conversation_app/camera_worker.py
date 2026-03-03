@@ -25,10 +25,11 @@ logger = logging.getLogger(__name__)
 class CameraWorker:
     """Thread-safe camera worker with frame buffering and face tracking."""
 
-    def __init__(self, reachy_mini: ReachyMini, head_tracker: Any = None) -> None:
+    def __init__(self, reachy_mini: ReachyMini, head_tracker: Any = None, recorder: Any = None) -> None:
         """Initialize."""
         self.reachy_mini = reachy_mini
         self.head_tracker = head_tracker
+        self.recorder = recorder
 
         # Thread-safe frame storage
         self.latest_frame: NDArray[np.uint8] | None = None
@@ -116,6 +117,9 @@ class CameraWorker:
                     # Thread-safe frame storage
                     with self.frame_lock:
                         self.latest_frame = frame  # .copy()
+
+                    if self.recorder is not None:
+                        self.recorder.record_frame(frame)
 
                     # Check if face tracking was just disabled
                     if self.previous_head_tracking_state and not self.is_head_tracking_enabled:

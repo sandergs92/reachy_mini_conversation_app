@@ -20,6 +20,7 @@ from reachy_mini_conversation_app.utils import (
     handle_vision_stuff,
     log_connection_troubleshooting,
 )
+from reachy_mini_conversation_app.session_recorder import SessionRecorder
 
 
 def update_chatbot(chatbot: List[Dict[str, Any]], response: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -100,6 +101,10 @@ def run(
 
     camera_worker, _, vision_manager = handle_vision_stuff(args, robot)
 
+    recorder = SessionRecorder(base_dir="data")
+    if camera_worker:
+        camera_worker.recorder = recorder
+
     movement_manager = MovementManager(
         current_robot=robot,
         camera_worker=camera_worker,
@@ -126,7 +131,7 @@ def run(
     )
     logger.debug(f"Chatbot avatar images: {chatbot.avatar_images}")
 
-    handler = OpenaiRealtimeHandler(deps, gradio_mode=args.gradio, instance_path=instance_path)
+    handler = OpenaiRealtimeHandler(deps, gradio_mode=args.gradio, instance_path=instance_path, recorder=recorder)
 
     stream_manager: gr.Blocks | LocalStream | None = None
 
@@ -176,6 +181,7 @@ def run(
     # Each async service → its own thread/loop
     movement_manager.start()
     head_wobbler.start()
+    recorder.start()
     if camera_worker:
         camera_worker.start()
     if vision_manager:
@@ -202,6 +208,7 @@ def run(
     finally:
         movement_manager.stop()
         head_wobbler.stop()
+        recorder.stop()
         if camera_worker:
             camera_worker.stop()
         if vision_manager:

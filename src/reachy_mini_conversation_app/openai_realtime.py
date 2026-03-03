@@ -56,7 +56,7 @@ def _compute_response_cost(usage: Any) -> float:
 class OpenaiRealtimeHandler(AsyncStreamHandler):
     """An OpenAI realtime handler for fastrtc Stream."""
 
-    def __init__(self, deps: ToolDependencies, gradio_mode: bool = False, instance_path: Optional[str] = None):
+    def __init__(self, deps: ToolDependencies, gradio_mode: bool = False, instance_path: Optional[str] = None, recorder: Any = None):
         """Initialize the handler."""
         super().__init__(
             expected_layout="mono",
@@ -69,6 +69,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self.input_sample_rate: Literal[24000] = self.input_sample_rate
 
         self.deps = deps
+        self.recorder = recorder
 
         # Override type annotations for OpenAI strict typing (only for values used in API)
         self.output_sample_rate = OPEN_AI_OUTPUT_SAMPLE_RATE
@@ -100,7 +101,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
-        return OpenaiRealtimeHandler(self.deps, self.gradio_mode, self.instance_path)
+        return OpenaiRealtimeHandler(self.deps, self.gradio_mode, self.instance_path, self.recorder)
 
     async def apply_personality(self, profile: str | None) -> str:
         """Apply a new personality (profile) at runtime if possible.
@@ -582,6 +583,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         except Exception as e:
             logger.debug("Dropping audio frame: connection not ready (%s)", e)
             return
+
+        if self.recorder is not None:
+            self.recorder.record_audio(audio_frame.tobytes())
 
     async def emit(self) -> Tuple[int, NDArray[np.int16]] | AdditionalOutputs | None:
         """Emit audio frame to be played by the speaker."""
