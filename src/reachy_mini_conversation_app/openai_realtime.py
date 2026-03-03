@@ -1,5 +1,6 @@
 import json
 import base64
+import collections
 import random
 import asyncio
 import logging
@@ -23,6 +24,7 @@ from reachy_mini_conversation_app.tools.core_tools import (
     ToolDependencies,
     get_tool_specs,
     dispatch_tool_call,
+    ALL_TOOLS,
 )
 
 
@@ -86,6 +88,16 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._vad_stop_chunks: int = 32
         self._vad_threshold: float = 0.5
         self._speech_ended: bool = False
+        self._vad_pre_buffer: "collections.deque[np.ndarray]" = collections.deque(maxlen=8)
+        self._vad_segment_chunks: list[np.ndarray] = []
+
+        # Barge-in / interrupt tracking
+        self._response_active: bool = False          # True while OpenAI is generating a response
+        self._current_response_id: str | None = None # ID of the in-flight response
+        self._interrupt_requested: bool = False       # Flag set synchronously by VAD, consumed async
+
+        # Two-phase response: tool-based gate (speech_gate) then audio
+        self._gate_check_active: bool = False         # True while a gate tool-call response is in flight
 
         # Override type annotations for OpenAI strict typing (only for values used in API)
         self.output_sample_rate = OPEN_AI_OUTPUT_SAMPLE_RATE
@@ -187,6 +199,53 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         except asyncio.CancelledError:
             logger.debug("Debounced partial cancelled")
             raise
+
+    async def _interrupt_response(self) -> None:
+        """Cancel the active OpenAI response and drain queued audio.
+
+        Called when the VAD detects that a user has started speaking while
+        the assistant is still generating / playing back audio.  This is
+        the core barge-in mechanism.
+
+        Gate responses (speech_gate tool calls) are NOT cancelled — they
+        generate no audio and complete quickly.  Cancelling them creates
+        orphaned tool calls that corrupt the conversation state.
+        """
+        if not self.connection:
+            return
+
+        # Don't cancel gate-only responses — they produce no audio and
+        # cancelling them leaves orphaned function calls in the context.
+        if self._gate_check_active and self._response_active:
+            logger.debug("Barge-in: skipping cancel for gate response (no audio to stop)")
+            return
+
+        # 1. Tell OpenAI to stop generating
+        try:
+            await self.connection.response.cancel()
+            logger.info("Barge-in: cancelled active OpenAI response")
+        except Exception as e:
+            logger.debug("Barge-in: response.cancel() failed (may already be done): %s", e)
+
+        # 2. Drain any already-queued audio frames so they are not played out
+        drained = 0
+        while not self.output_queue.empty():
+            try:
+                item = self.output_queue.get_nowait()
+                # Keep AdditionalOutputs (chat messages) — only drop raw audio tuples
+                if isinstance(item, tuple):
+                    drained += 1
+                else:
+                    # Re-queue non-audio items (transcript outputs, etc.)
+                    await self.output_queue.put(item)
+            except asyncio.QueueEmpty:
+                break
+        if drained:
+            logger.debug("Barge-in: drained %d audio frames from output queue", drained)
+
+        self._response_active = False
+        self._current_response_id = None
+        self._gate_check_active = False
 
     async def start_up(self) -> None:
         """Start the handler with minimal retries on unexpected websocket closure."""
@@ -309,7 +368,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                 "voice": get_session_voice(),
                             },
                         },
-                        "tools": get_tool_specs(),  # type: ignore[typeddict-item]
+                        "tools": get_tool_specs(exclusion_list=["speech_gate"]),  # type: ignore[typeddict-item]
                         "tool_choice": "auto",
                     },
                 )
@@ -353,12 +412,19 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
                 if event.type == "response.created":
                     logger.debug("Response created")
+                    self._response_active = True
+                    resp = getattr(event, "response", None)
+                    self._current_response_id = getattr(resp, "id", None)
 
                 if event.type == "response.done":
                     # Doesn't mean the audio is done playing
                     logger.debug("Response done")
+                    self._response_active = False
+                    self._current_response_id = None
 
-
+                    # Clean up gate state if a gate response completes (e.g. timed out or errored)
+                    if self._gate_check_active:
+                        self._gate_check_active = False
 
                     response = getattr(event, "response", None)
                     usage = getattr(response, "usage", None) if response else None
@@ -411,6 +477,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
                 # Handle audio delta
                 if event.type in ("response.audio.delta", "response.output_audio.delta"):
+                    # If user started speaking (barge-in), drop audio instead of queuing
+                    if self._interrupt_requested:
+                        logger.debug("Dropping audio delta during barge-in")
+                        continue
                     if self.deps.head_wobbler is not None:
                         self.deps.head_wobbler.feed(event.delta)
                     self.last_activity_time = asyncio.get_event_loop().time()
@@ -431,6 +501,57 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     if not isinstance(tool_name, str) or not isinstance(args_json_str, str):
                         logger.error("Invalid tool call: tool_name=%s, args=%s", tool_name, args_json_str)
                         continue
+
+                    # --- Handle speech_gate tool (two-phase gate) ---
+                    if tool_name == "speech_gate":
+                        was_active = self._gate_check_active
+                        self._gate_check_active = False
+
+                        try:
+                            gate_args = json.loads(args_json_str or "{}")
+                        except Exception:
+                            gate_args = {}
+                        decision = gate_args.get("decision", "silent")
+                        draft_response = gate_args.get("draft_response", "")
+
+                        # Always submit tool output to satisfy the function call
+                        # (even for stale/cancelled gates — prevents orphaned calls in context)
+                        if isinstance(call_id, str) and self.connection:
+                            try:
+                                await self.connection.conversation.item.create(
+                                    item={
+                                        "type": "function_call_output",
+                                        "call_id": call_id,
+                                        "output": json.dumps({"status": "ok"}),
+                                    },
+                                )
+                            except Exception as e:
+                                logger.debug("Failed to submit gate tool output: %s", e)
+
+                        # If the gate was cancelled by barge-in, discard the stale result
+                        if not was_active:
+                            logger.debug("Discarding stale speech_gate call (gate was cancelled by barge-in)")
+                            continue
+
+                        if decision == "silent":
+                            logger.info("Gate check: model chose silence — suppressing response")
+                            await self.output_queue.put(AdditionalOutputs({"role": "assistant", "content": "..."}))
+                        elif decision == "creative_direction":
+                            logger.info("Gate check: model detected creative direction — triggering full tool response")
+                            if self.connection:
+                                try:
+                                    await self.connection.response.create()
+                                except Exception as e:
+                                    logger.debug("response.create() for creative direction failed: %s", e)
+                        else:
+                            logger.info("Gate check: model wants to speak (%s) — triggering audio response", draft_response[:80] if draft_response else "")
+                            if self.connection:
+                                try:
+                                    await self.connection.response.create()
+                                except Exception as e:
+                                    logger.debug("Audio response.create() after gate failed: %s", e)
+                        continue
+                    # --- End speech_gate handling ---
 
                     try:
                         tool_result = await dispatch_tool_call(tool_name, args_json_str, self.deps)
@@ -546,7 +667,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     logger.error("Realtime error [%s]: %s (raw=%s)", code, msg, err)
 
                     # Only show user-facing errors, not internal state errors
-                    if code not in ("input_audio_buffer_commit_empty", "conversation_already_has_active_response"):
+                    if code not in ("input_audio_buffer_commit_empty", "conversation_already_has_active_response", "response_cancel_not_active"):
                         await self.output_queue.put(
                             AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                         )
@@ -574,7 +695,16 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             return ""
         return f"Speaker {spk + 1} says: "
 
-    async def _flush_and_respond(self) -> None:
+    async def _flush_transcript(self) -> None:
+        """Flush accumulated transcript into context and trigger a gate tool call.
+
+        Uses ``response.create()`` with ``tool_choice="required"`` and an
+        inline ``speech_gate`` tool spec.  The model is forced to call the
+        tool (no audio is synthesized for tool calls), giving us a
+        zero-audio gate.  The tool-call handler inspects the result:
+        ``decision="silent"`` suppresses the response, ``decision="respond"``
+        triggers a normal audio ``response.create()``.
+        """
         if not self._pending_transcript_parts:
             return
         parts = [p for p in self._pending_transcript_parts if p.strip("*.! ")]
@@ -594,6 +724,27 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         prefixed_text = f"{prefix}{text}"
         if self.connection:
             try:
+                # Cancel any in-flight AUDIO response before sending a new user message.
+                # Gate responses (tool_choice=required) are left alone — they produce
+                # no audio and cancelling them creates orphaned tool calls.
+                if self._response_active and not self._gate_check_active:
+                    try:
+                        await self.connection.response.cancel()
+                        logger.debug("Cancelled active audio response before new user turn")
+                    except Exception as e:
+                        logger.debug("response.cancel() before flush failed: %s", e)
+                    self._response_active = False
+                    self._current_response_id = None
+                    # Drain leftover audio
+                    while not self.output_queue.empty():
+                        try:
+                            item = self.output_queue.get_nowait()
+                            if not isinstance(item, tuple):
+                                await self.output_queue.put(item)
+                        except asyncio.QueueEmpty:
+                            break
+
+                # Add message to context
                 await self.connection.conversation.item.create(
                     item={
                         "type": "message",
@@ -601,14 +752,64 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         "content": [{"type": "input_text", "text": prefixed_text}],
                     },
                 )
-                await self.connection.response.create()
+
+                # Trigger gate check via forced tool call — no audio synthesized
+                if self._gate_check_active:
+                    # A previous gate is still in flight — don't stack another one.
+                    # The user message was already added to context above, so the
+                    # next gate (or the one in flight) will see it.
+                    logger.debug("Gate already active, skipping new gate for: %s", prefixed_text)
+                else:
+                    self._gate_check_active = True
+                    gate_tool = ALL_TOOLS.get("speech_gate")
+                    if not gate_tool:
+                        logger.error("speech_gate tool not found in registry — add it to tools.txt")
+                        self._gate_check_active = False
+                        await self.connection.response.create()
+                    else:
+                        await self.connection.response.create(
+                            response={
+                                "instructions": (
+                                    "You MUST call the speech_gate tool now.\n"
+                                    "Your DEFAULT is silence. Choose 'silent' UNLESS one of these applies:\n\n"
+                                    "Choose 'respond' when:\n"
+                                    "- Someone uses your name (Ronnie/Ronny/robot) AND asks you something\n"
+                                    "- Someone is clearly talking TO you (not to another human), even without using your name\n"
+                                    "- Someone explicitly invites you to speak\n\n"
+                                    "Choose 'creative_direction' when:\n"
+                                    "- A speaker says they want to creatively direct you, change your tone/style/scene\n"
+                                    "- You hear phrases like 'creatief bijsturen', 'toon en stijl', 'scène veranderen'\n"
+                                    "- This applies even if the speaker is not using your name\n\n"
+                                    "Choose 'silent' (DEFAULT) when:\n"
+                                    "- Speakers are talking to each other (even if they mention your name while doing so)\n"
+                                    "- Someone introduces the conversation setup ('we gaan praten met de robot')\n"
+                                    "- Someone is telling a story or monologuing\n"
+                                    "- Someone tells you to be quiet or stay silent\n"
+                                    "- You are unsure in ANY way\n"
+                                    "- You just spoke and were corrected — stay silent for many turns\n\n"
+                                    "When in doubt: 'silent'. Missing a turn is fine. Interrupting is not."
+                                ),
+                                "tools": [gate_tool.spec()],
+                                "tool_choice": "required",
+                            },
+                        )
+                    logger.debug("Gate tool check triggered for: %s", prefixed_text)
+
             except Exception as e:
-                logger.debug("Failed to send transcript or trigger response: %s", e)
+                logger.debug("Failed to send transcript or trigger gate: %s", e)
+                self._gate_check_active = False
         await self.output_queue.put(AdditionalOutputs({"role": "user", "content": prefixed_text}))
-        logger.debug("Flushed transcript and triggered response: %s", prefixed_text)
 
     async def _poll_streamer_events(self) -> None:
         while not self._shutdown_requested:
+            # Handle pending barge-in interrupt (flag set by synchronous VAD)
+            if self._interrupt_requested and self._response_active:
+                self._interrupt_requested = False
+                await self._interrupt_response()
+            elif self._interrupt_requested:
+                # Response already finished, just clear the flag
+                self._interrupt_requested = False
+
             if self.streamer is None:
                 return
             events = self.streamer.poll_events()
@@ -621,6 +822,9 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                         self._pending_transcript_parts.append(text)
                         self._pending_transcript_words.extend(ev.words)
                         self.last_activity_time = asyncio.get_event_loop().time()
+                        if len(self._pending_transcript_parts) > 200:
+                            self._pending_transcript_parts = self._pending_transcript_parts[-100:]
+                            self._pending_transcript_words = self._pending_transcript_words[-500:]
                 elif ev.kind == "active":
                     self.partial_transcript_sequence += 1
                     current_sequence = self.partial_transcript_sequence
@@ -636,9 +840,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                     )
             if self._speech_ended and self._pending_transcript_parts:
                 self._speech_ended = False
-                await self._flush_and_respond()
-            await asyncio.sleep(0.05)
-
+                await self._flush_transcript()
             await asyncio.sleep(0.05)
 
     def _ensure_vad(self) -> None:
@@ -663,32 +865,58 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             resampled = audio_frame_int16.astype(np.float32)
         resampled = resampled / 32768.0
         self._ensure_vad()
+
         self._vad_buf = np.concatenate([self._vad_buf, resampled])
+
         while len(self._vad_buf) >= 512:
             vad_chunk = self._vad_buf[:512]
             self._vad_buf = self._vad_buf[512:]
             prob = self._vad_model(torch.from_numpy(vad_chunk), self._streamer_sample_rate).item()
             was_speech = self._vad_is_speech
             is_speech = prob > self._vad_threshold
-            if is_speech:
-                self._vad_silence_chunks = 0
-                if not was_speech:
+
+            if not was_speech:
+                self._vad_pre_buffer.append(vad_chunk)
+
+                if is_speech:
                     self._vad_is_speech = True
+                    self._vad_silence_chunks = 0
                     self.deps.movement_manager.set_listening(True)
                     if self.deps.head_wobbler is not None:
                         self.deps.head_wobbler.reset()
                     self.last_activity_time = asyncio.get_event_loop().time()
                     logger.debug("Silero VAD: speech started")
+                    if self._response_active:
+                        self._interrupt_requested = True
+                        logger.info("Silero VAD: barge-in requested (response active)")
+
+                    preroll_chunks = list(self._vad_pre_buffer)
+                    preroll_chunks.append(vad_chunk)
+                    preroll_audio = np.concatenate(preroll_chunks)
+                    preroll_limit = int(self._streamer_sample_rate * 0.24)
+                    if len(preroll_audio) > preroll_limit:
+                        preroll_audio = preroll_audio[-preroll_limit:]
+                    self._streamer_buf = np.concatenate([preroll_audio, self._streamer_buf])
+                    self._vad_segment_chunks = preroll_chunks
             else:
-                if was_speech:
+                self._vad_segment_chunks.append(vad_chunk)
+
+                if is_speech:
+                    self._vad_silence_chunks = 0
+                else:
                     self._vad_silence_chunks += 1
-                    if self._vad_silence_chunks >= self._vad_stop_chunks:
-                        self._vad_is_speech = False
-                        self._vad_silence_chunks = 0
-                        self._speech_ended = True
-                        self.deps.movement_manager.set_listening(False)
-                        logger.debug("Silero VAD: speech ended")
-        self._streamer_buf = np.concatenate([self._streamer_buf, resampled])
+
+                self._streamer_buf = np.concatenate([self._streamer_buf, vad_chunk])
+
+                if self._vad_silence_chunks >= self._vad_stop_chunks:
+                    self._vad_is_speech = False
+                    self._vad_silence_chunks = 0
+                    self._speech_ended = True
+                    self.deps.movement_manager.set_listening(False)
+                    self._vad_segment_chunks.clear()
+                    self._vad_pre_buffer.clear()
+                    logger.debug("Silero VAD: speech ended")
+
         while len(self._streamer_buf) >= self._streamer_chunk_samples:
             chunk = self._streamer_buf[:self._streamer_chunk_samples]
             self._streamer_buf = self._streamer_buf[self._streamer_chunk_samples:]

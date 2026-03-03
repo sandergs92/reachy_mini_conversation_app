@@ -7,3 +7,4 @@ do_nothing
 head_tracking
 move_head
 creative_direction_tool
+speech_gate
