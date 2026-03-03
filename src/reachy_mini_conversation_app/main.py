@@ -1,6 +1,7 @@
 """Entrypoint for the Reachy Mini conversation app."""
 
 import os
+import logging
 import sys
 import time
 import asyncio
@@ -49,6 +50,7 @@ def run(
     from reachy_mini_conversation_app.openai_realtime import OpenaiRealtimeHandler
     from reachy_mini_conversation_app.tools.core_tools import ToolDependencies
     from reachy_mini_conversation_app.audio.head_wobbler import HeadWobbler
+    from reachy_mini_conversation_app.pipeline import build_diar_asr_pipeline, StreamingDiarAsrStreamer, cuda_mps
 
     logger = setup_logger(args.debug)
     logger.info("Starting Reachy Mini Conversation App")
@@ -131,7 +133,36 @@ def run(
     )
     logger.debug(f"Chatbot avatar images: {chatbot.avatar_images}")
 
-    handler = OpenaiRealtimeHandler(deps, gradio_mode=args.gradio, instance_path=instance_path, recorder=recorder)
+    logging.getLogger("faster_whisper").setLevel(logging.WARNING)
+
+    cuda_mps_ctx = cuda_mps()
+    cuda_mps_ctx.__enter__()
+
+    PIPELINE_SR = 16_000
+    CHUNK_DURATION_S = 0.32
+    CHUNK_SAMPLES = int(PIPELINE_SR * CHUNK_DURATION_S)
+    DIAR_CHUNK_SAMPLES = 3 * 8 * 160
+    MAX_SECONDS = 10.0
+    LANGUAGE = "nl"
+    NUM_SPK = 4
+
+    logger.info("Loading ASR+Diarization pipeline...")
+    asr_diar_pipe = build_diar_asr_pipeline(
+        max_duration_s=3600.0,
+        language=LANGUAGE,
+        num_spk=NUM_SPK,
+    )
+    logger.info("ASR+Diarization pipeline loaded.")
+
+    streamer = StreamingDiarAsrStreamer(
+        asr_diar_pipe,
+        sample_rate=PIPELINE_SR,
+        chunk_samples=CHUNK_SAMPLES,
+        diar_chunk_samples=DIAR_CHUNK_SAMPLES,
+        max_seconds=MAX_SECONDS,
+    )
+
+    handler = OpenaiRealtimeHandler(deps, gradio_mode=args.gradio, instance_path=instance_path, recorder=recorder, streamer=streamer)
 
     stream_manager: gr.Blocks | LocalStream | None = None
 
@@ -219,6 +250,11 @@ def run(
             robot.media.close()
         except Exception as e:
             logger.debug(f"Error closing media during shutdown: {e}")
+
+        if asr_diar_pipe is not None:
+            asr_diar_pipe.close()
+
+        cuda_mps_ctx.__exit__(None, None, None)
 
         # prevent connection to keep alive some threads
         robot.client.disconnect()

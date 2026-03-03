@@ -56,7 +56,7 @@ def _compute_response_cost(usage: Any) -> float:
 class OpenaiRealtimeHandler(AsyncStreamHandler):
     """An OpenAI realtime handler for fastrtc Stream."""
 
-    def __init__(self, deps: ToolDependencies, gradio_mode: bool = False, instance_path: Optional[str] = None, recorder: Any = None):
+    def __init__(self, deps: ToolDependencies, gradio_mode: bool = False, instance_path: Optional[str] = None, recorder: Any = None, streamer: Any = None):
         """Initialize the handler."""
         super().__init__(
             expected_layout="mono",
@@ -70,6 +70,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         self.deps = deps
         self.recorder = recorder
+        self.streamer = streamer
+        self._streamer_sample_rate: int = 16000
+        self._streamer_chunk_samples: int = streamer.chunk_samples if streamer else 0
+        self._streamer_buf = np.empty(0, dtype=np.float32)
+        self._streamer_key: int = 0
+        self._streamer_poll_task: Optional[asyncio.Task[None]] = None
 
         # Override type annotations for OpenAI strict typing (only for values used in API)
         self.output_sample_rate = OPEN_AI_OUTPUT_SAMPLE_RATE
@@ -101,7 +107,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
     def copy(self) -> "OpenaiRealtimeHandler":
         """Create a copy of the handler."""
-        return OpenaiRealtimeHandler(self.deps, self.gradio_mode, self.instance_path, self.recorder)
+        return OpenaiRealtimeHandler(self.deps, self.gradio_mode, self.instance_path, self.recorder, self.streamer)
 
     async def apply_personality(self, profile: str | None) -> str:
         """Apply a new personality (profile) at runtime if possible.
@@ -283,7 +289,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                     "type": "audio/pcm",
                                     "rate": self.input_sample_rate,
                                 },
-                                "transcription": {"model": "gpt-4o-transcribe", "language": "en"},
+                                **({}  if self.streamer else {"transcription": {"model": "gpt-4o-transcribe", "language": "en"}}),
                                 "turn_detection": {
                                     "type": "server_vad",
                                     "interrupt_response": True,
@@ -321,6 +327,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 self._connected_event.set()
             except Exception:
                 pass
+            if self.streamer is not None:
+                self._streamer_poll_task = asyncio.create_task(self._poll_streamer_events())
             async for event in self.connection:
                 logger.debug(f"OpenAI event: {event.type}")
                 if event.type == "input_audio_buffer.speech_started":
@@ -543,6 +551,55 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                         )
 
+    async def _poll_streamer_events(self) -> None:
+        while not self._shutdown_requested:
+            if self.streamer is None:
+                return
+            events = self.streamer.poll_events()
+            for ev in events:
+                text = ev.text.strip() if ev.text else ""
+                if not text:
+                    continue
+                if ev.kind == "confirmed_turn":
+                    if self.partial_transcript_task and not self.partial_transcript_task.done():
+                        self.partial_transcript_task.cancel()
+                        try:
+                            await self.partial_transcript_task
+                        except asyncio.CancelledError:
+                            pass
+                    await self.output_queue.put(AdditionalOutputs({"role": "user", "content": text}))
+                    logger.debug("Streamer confirmed transcript: %s", text)
+                elif ev.kind == "active":
+                    self.partial_transcript_sequence += 1
+                    current_sequence = self.partial_transcript_sequence
+                    if self.partial_transcript_task and not self.partial_transcript_task.done():
+                        self.partial_transcript_task.cancel()
+                        try:
+                            await self.partial_transcript_task
+                        except asyncio.CancelledError:
+                            pass
+                    self.partial_transcript_task = asyncio.create_task(
+                        self._emit_debounced_partial(text, current_sequence)
+                    )
+            await asyncio.sleep(0.05)
+
+    def _feed_streamer(self, audio_frame_int16: np.ndarray, input_sr: int) -> None:
+        if self.streamer is None:
+            return
+        target_sr = self._streamer_sample_rate
+        if input_sr != target_sr:
+            n_samples = int(len(audio_frame_int16) * target_sr / input_sr)
+            resampled = resample(audio_frame_int16.astype(np.float32), n_samples).astype(np.float32)
+        else:
+            resampled = audio_frame_int16.astype(np.float32)
+        resampled = resampled / 32768.0
+        self._streamer_buf = np.concatenate([self._streamer_buf, resampled])
+        while len(self._streamer_buf) >= self._streamer_chunk_samples:
+            chunk = self._streamer_buf[:self._streamer_chunk_samples]
+            self._streamer_buf = self._streamer_buf[self._streamer_chunk_samples:]
+            self.streamer.push(self._streamer_key, chunk, is_final=False)
+            self._streamer_key += self._streamer_chunk_samples
+
     # Microphone receive
     async def receive(self, frame: Tuple[int, NDArray[np.int16]]) -> None:
         """Receive audio frame from the microphone and send it to the OpenAI server.
@@ -587,6 +644,8 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         if self.recorder is not None:
             self.recorder.record_audio(audio_frame.tobytes())
 
+        self._feed_streamer(audio_frame, self.input_sample_rate)
+
     async def emit(self) -> Tuple[int, NDArray[np.int16]] | AdditionalOutputs | None:
         """Emit audio frame to be played by the speaker."""
         # sends to the stream the stuff put in the output queue by the openai event handler
@@ -608,6 +667,12 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
     async def shutdown(self) -> None:
         """Shutdown the handler."""
         self._shutdown_requested = True
+        if self._streamer_poll_task and not self._streamer_poll_task.done():
+            self._streamer_poll_task.cancel()
+            try:
+                await self._streamer_poll_task
+            except asyncio.CancelledError:
+                pass
         # Cancel any pending debounce task
         if self.partial_transcript_task and not self.partial_transcript_task.done():
             self.partial_transcript_task.cancel()
