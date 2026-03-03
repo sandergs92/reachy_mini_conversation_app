@@ -498,19 +498,31 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                 },
                             )
                             logger.info("Session instructions updated with creative direction")
+                            await self.connection.response.create(
+                                response={
+                                    "instructions": (
+                                        _get_full_instructions()
+                                        + "\n\nThe creative session state was just updated. "
+                                        "Briefly acknowledge what changed by expressing the new "
+                                        "scene, tone, and expression through your IDENTITY, "
+                                        "BACKSTORY, CORE TRAITS, BEHAVIOR RULES, and RESPONSE "
+                                        "EXAMPLES. Do NOT read back the raw values. Instead, "
+                                        "demonstrate the shift naturally in character."
+                                    ),
+                                },
+                            )
                         except Exception as e:
                             logger.warning("Failed to update session with creative direction: %s", e)
 
-                    # if this tool call was triggered by an idle signal, don't make the robot speak
-                    # for other tool calls, let the robot reply out loud
-                    if self.is_idle_tool_call:
-                        self.is_idle_tool_call = False
-                    else:
+                    elif not self.is_idle_tool_call:
                         await self.connection.response.create(
                             response={
                                 "instructions": _get_full_instructions() + "\n\nUse the tool result just returned and answer concisely in speech.",
                             },
                         )
+
+                    if self.is_idle_tool_call:
+                        self.is_idle_tool_call = False
 
                     # re synchronize the head wobble after a tool call that may have taken some time
                     if self.deps.head_wobbler is not None:
