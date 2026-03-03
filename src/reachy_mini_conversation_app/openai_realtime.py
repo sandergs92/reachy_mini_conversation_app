@@ -14,6 +14,7 @@ from openai import AsyncOpenAI
 from fastrtc import AdditionalOutputs, AsyncStreamHandler, wait_for_item, audio_to_int16
 from numpy.typing import NDArray
 from scipy.signal import resample
+import torch
 from websockets.exceptions import ConnectionClosedError
 
 from reachy_mini_conversation_app.config import config
@@ -76,6 +77,15 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         self._streamer_buf = np.empty(0, dtype=np.float32)
         self._streamer_key: int = 0
         self._streamer_poll_task: Optional[asyncio.Task[None]] = None
+        self._pending_transcript_parts: list[str] = []
+        self._pending_transcript_words: list = []
+        self._vad_buf = np.empty(0, dtype=np.float32)
+        self._vad_model: Any = None
+        self._vad_is_speech: bool = False
+        self._vad_silence_chunks: int = 0
+        self._vad_stop_chunks: int = 32
+        self._vad_threshold: float = 0.5
+        self._speech_ended: bool = False
 
         # Override type annotations for OpenAI strict typing (only for values used in API)
         self.output_sample_rate = OPEN_AI_OUTPUT_SAMPLE_RATE
@@ -289,11 +299,7 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                                     "type": "audio/pcm",
                                     "rate": self.input_sample_rate,
                                 },
-                                **({}  if self.streamer else {"transcription": {"model": "gpt-4o-transcribe", "language": "en"}}),
-                                "turn_detection": {
-                                    "type": "server_vad",
-                                    "interrupt_response": True,
-                                },
+                                "turn_detection": None,
                             },
                             "output": {
                                 "format": {
@@ -332,16 +338,10 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
             async for event in self.connection:
                 logger.debug(f"OpenAI event: {event.type}")
                 if event.type == "input_audio_buffer.speech_started":
-                    if hasattr(self, "_clear_queue") and callable(self._clear_queue):
-                        self._clear_queue()
-                    if self.deps.head_wobbler is not None:
-                        self.deps.head_wobbler.reset()
-                    self.deps.movement_manager.set_listening(True)
-                    logger.debug("User speech started")
+                    logger.debug("Server speech_started (no-op, using local VAD)")
 
                 if event.type == "input_audio_buffer.speech_stopped":
-                    self.deps.movement_manager.set_listening(False)
-                    logger.debug("User speech stopped - server will auto-commit with VAD")
+                    logger.debug("Server speech_stopped (no-op, using local VAD)")
 
                 if event.type in (
                     "response.audio.done",  # GA
@@ -551,6 +551,62 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             AdditionalOutputs({"role": "assistant", "content": f"[error] {msg}"})
                         )
 
+    def _speaker_prefix_from_words(self, words: list) -> str:
+        if not words or self.streamer is None:
+            return ""
+        lookup = self.streamer.pipe.speaker_lookup
+        counts: dict[int, int] = {}
+        for w in words:
+            spk = lookup.get_word_speaker(w)
+            if spk is not None:
+                counts[spk] = counts.get(spk, 0) + 1
+        if not counts:
+            return ""
+        dominant = max(counts, key=counts.get)
+        return f"Speaker {dominant + 1} says: "
+
+    @staticmethod
+    def _speaker_prefix(meta: dict | None) -> str:
+        if meta is None:
+            return ""
+        spk = meta.get("speaker")
+        if spk is None:
+            return ""
+        return f"Speaker {spk + 1} says: "
+
+    async def _flush_and_respond(self) -> None:
+        if not self._pending_transcript_parts:
+            return
+        parts = [p for p in self._pending_transcript_parts if p.strip("*.! ")]
+        words = list(self._pending_transcript_words)
+        self._pending_transcript_parts.clear()
+        self._pending_transcript_words.clear()
+        text = " ".join(parts).strip()
+        if not text:
+            return
+        if self.partial_transcript_task and not self.partial_transcript_task.done():
+            self.partial_transcript_task.cancel()
+            try:
+                await self.partial_transcript_task
+            except asyncio.CancelledError:
+                pass
+        prefix = self._speaker_prefix_from_words(words)
+        prefixed_text = f"{prefix}{text}"
+        if self.connection:
+            try:
+                await self.connection.conversation.item.create(
+                    item={
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": prefixed_text}],
+                    },
+                )
+                await self.connection.response.create()
+            except Exception as e:
+                logger.debug("Failed to send transcript or trigger response: %s", e)
+        await self.output_queue.put(AdditionalOutputs({"role": "user", "content": prefixed_text}))
+        logger.debug("Flushed transcript and triggered response: %s", prefixed_text)
+
     async def _poll_streamer_events(self) -> None:
         while not self._shutdown_requested:
             if self.streamer is None:
@@ -560,15 +616,11 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                 text = ev.text.strip() if ev.text else ""
                 if not text:
                     continue
-                if ev.kind == "confirmed_turn":
-                    if self.partial_transcript_task and not self.partial_transcript_task.done():
-                        self.partial_transcript_task.cancel()
-                        try:
-                            await self.partial_transcript_task
-                        except asyncio.CancelledError:
-                            pass
-                    await self.output_queue.put(AdditionalOutputs({"role": "user", "content": text}))
-                    logger.debug("Streamer confirmed transcript: %s", text)
+                if ev.kind == "confirmed":
+                    if text.strip("*.! "):
+                        self._pending_transcript_parts.append(text)
+                        self._pending_transcript_words.extend(ev.words)
+                        self.last_activity_time = asyncio.get_event_loop().time()
                 elif ev.kind == "active":
                     self.partial_transcript_sequence += 1
                     current_sequence = self.partial_transcript_sequence
@@ -578,10 +630,27 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
                             await self.partial_transcript_task
                         except asyncio.CancelledError:
                             pass
+                    prefix = self._speaker_prefix(ev.meta)
                     self.partial_transcript_task = asyncio.create_task(
-                        self._emit_debounced_partial(text, current_sequence)
+                        self._emit_debounced_partial(f"{prefix}{text}", current_sequence)
                     )
+            if self._speech_ended and self._pending_transcript_parts:
+                self._speech_ended = False
+                await self._flush_and_respond()
             await asyncio.sleep(0.05)
+
+            await asyncio.sleep(0.05)
+
+    def _ensure_vad(self) -> None:
+        if self._vad_model is not None:
+            return
+        self._vad_model, _ = torch.hub.load(
+            repo_or_dir="snakers4/silero-vad",
+            model="silero_vad",
+            trust_repo=True,
+        )
+        self._vad_model.eval()
+        logger.info("Silero VAD loaded")
 
     def _feed_streamer(self, audio_frame_int16: np.ndarray, input_sr: int) -> None:
         if self.streamer is None:
@@ -593,6 +662,32 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
         else:
             resampled = audio_frame_int16.astype(np.float32)
         resampled = resampled / 32768.0
+        self._ensure_vad()
+        self._vad_buf = np.concatenate([self._vad_buf, resampled])
+        while len(self._vad_buf) >= 512:
+            vad_chunk = self._vad_buf[:512]
+            self._vad_buf = self._vad_buf[512:]
+            prob = self._vad_model(torch.from_numpy(vad_chunk), self._streamer_sample_rate).item()
+            was_speech = self._vad_is_speech
+            is_speech = prob > self._vad_threshold
+            if is_speech:
+                self._vad_silence_chunks = 0
+                if not was_speech:
+                    self._vad_is_speech = True
+                    self.deps.movement_manager.set_listening(True)
+                    if self.deps.head_wobbler is not None:
+                        self.deps.head_wobbler.reset()
+                    self.last_activity_time = asyncio.get_event_loop().time()
+                    logger.debug("Silero VAD: speech started")
+            else:
+                if was_speech:
+                    self._vad_silence_chunks += 1
+                    if self._vad_silence_chunks >= self._vad_stop_chunks:
+                        self._vad_is_speech = False
+                        self._vad_silence_chunks = 0
+                        self._speech_ended = True
+                        self.deps.movement_manager.set_listening(False)
+                        logger.debug("Silero VAD: speech ended")
         self._streamer_buf = np.concatenate([self._streamer_buf, resampled])
         while len(self._streamer_buf) >= self._streamer_chunk_samples:
             chunk = self._streamer_buf[:self._streamer_chunk_samples]
@@ -632,14 +727,6 @@ class OpenaiRealtimeHandler(AsyncStreamHandler):
 
         # Cast if needed
         audio_frame = audio_to_int16(audio_frame)
-
-        # Send to OpenAI (guard against races during reconnect)
-        try:
-            audio_message = base64.b64encode(audio_frame.tobytes()).decode("utf-8")
-            await self.connection.input_audio_buffer.append(audio=audio_message)
-        except Exception as e:
-            logger.debug("Dropping audio frame: connection not ready (%s)", e)
-            return
 
         if self.recorder is not None:
             self.recorder.record_audio(audio_frame.tobytes())
